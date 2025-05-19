@@ -1,154 +1,158 @@
-from fastapi import FastAPI, HTTPException, Depends
-from sqlalchemy import create_engine, Column, Integer, String, Float
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from pydantic import BaseModel
-
-from response.response import ProduktResponse
-from openai_service import router as openai_router
-from qdrant_embedings import qdrant_router
-DATABASE_URL = "postgresql://postgres:1234@localhost:6666/porownywarka"
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-Base = declarative_base()
-
-from sqlalchemy import ForeignKey
-from sqlalchemy.orm import relationship
-
-class Produkt(Base):
-    __tablename__ = "produkty"
-    
-    id_produktu = Column(Integer, primary_key=True, index=True)
-    nazwa = Column(String, index=True)
-    
-    # Relacja z tabelą Cena
-    ceny = relationship("Cena", back_populates="produkt")
-    
-class Cena(Base):
-    __tablename__ = "ceny"
-    
-    # Produkt_id jako klucz obcy
-    produkt_id = Column(Integer, ForeignKey("produkty.id_produktu"), primary_key=True, index=True)
-    
-    cena = Column(Float)
-    
-    # Relacja z tabelą Produkt
-    produkt = relationship("Produkt", back_populates="ceny")
-
-# Tworzenie tabeli w bazie
-Base.metadata.create_all(bind=engine)
-
+import json
+from typing import Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, MetaData, Table, desc, text
+from sqlalchemy.sql import select
+from sqlalchemy.dialects.postgresql import insert
+from sentence_transformers import SentenceTransformer
+import os
 
 app = FastAPI()
-app.include_router(
-    openai_router,
-    prefix="/openai"
-)
-app.include_router(qdrant_router)
-# Model Pydantic do walidacji
-class ProduktSchema(BaseModel):
-    nazwa: str
-    cena: float
 
-# Dependency do pobierania sesji bazy danych
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
-# 📌 Endpointy API
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://tomek:Haslo123@localhost:6666/porownywarka")
 
-# Pobierz wszystkie produkty
-@app.get("/produkty")
-def get_produkty(db: Session = Depends(get_db)):
-    produkty = db.query(Produkt).all()  
-    
-    # Prosta lista słowników z produktami i ich cenami
-    response = []
-    for produkt in produkty:
-        cena = produkt.ceny[0].cena if produkt.ceny else None  # Pobierz cenę (jeśli istnieje)
+engine = create_engine(DATABASE_URL)
+metadata = MetaData()
+
+# Ładowanie tabel
+products = Table("products", metadata, autoload_with=engine)
+prices = Table("prices", metadata, autoload_with=engine)
+
+# Model odpowiedzi
+class ProductResponse(BaseModel):
+    id: int
+    name: str
+    price: float | None
+    description: str | None
+    embedding: list[float]
+class SimpleProductResponse(BaseModel):
+    id: int
+    name: str
+    price: float
+    description: Optional[str] = Field(None)
+    class Config:
+        orm_mode = True
+        allow_population_by_field_name = True
+
+class ProductsResponseList(BaseModel):
+    products: list[SimpleProductResponse]
+@app.get("/products", response_model=list[SimpleProductResponse])
+def get_products():
+    with engine.connect() as conn:
+        stmt = select(
+            products.c.id,
+            products.c.name,
+            products.c.description,
+            prices.c.price
+        ).select_from(
+            products.join(prices, products.c.id == prices.c.id)
+        )
+        result = conn.execute(stmt)
         
-        response.append({
-            "id_produktu": produkt.id_produktu,
-            "nazwa": produkt.nazwa,
-            "cena": cena
-        })
-    
-    return response
-@app.get("/ceny")
-def get_produkty(db: Session = Depends(get_db)):
-    
-    produkty = db.query(Cena).all()
-    return produkty
+        product_list = []
+        for row in result:
+            
+            product_data = {
+                "id": row.id,
+                "name": row.name,
+                "description": getattr(row, 'description', None),
+                "price": row.price
+            }
+            if hasattr(row, 'description') and row.description is not None:
+                product_data["description"] = row.description
+                
+            product_list.append(product_data)
+            
+        return product_list
+@app.get("/product/{product_id}", response_model=ProductResponse)
+def get_product(product_id: int):
+    with engine.connect() as conn:
+        stmt = (
+            select(products.c.id, products.c.name, prices.c.price,products.c.embedding,products.c.description)
+            .select_from(products.join(prices, products.c.id == prices.c.id))
+            .where(products.c.id == product_id)
+        )
+        result = conn.execute(stmt).first()
+        embedding = result.embedding
+        if isinstance(embedding, str):
+            try:
+                embedding = json.loads(embedding)
+            except json.JSONDecodeError:
+               
+                embedding = []
+        if not result:
+            raise HTTPException(status_code=404, detail="Product not found")
 
-@app.get("/produkty/{produkt_id}", response_model=ProduktResponse)
-def get_produkt(produkt_id: int, db: Session = Depends(get_db)):
-    produkt = db.query(Produkt).filter(Produkt.id_produktu == produkt_id).first()
-    if produkt is None:
-        raise HTTPException(status_code=404, detail="Produkt nie znaleziony")
-    
-    cena_row = db.query(Cena.cena).filter(Cena.produkt_id == produkt_id).first()
-    
-    if cena_row is None:
-        raise HTTPException(status_code=404, detail="Cena nie znaleziona")
-    
-    cena = cena_row[0]  # 🔹 Wyciągamy liczbę float z krotki
+        return {
+            "id": result.id,
+            "name": result.name,
+            "price": result.price,
+            "description": result.description,
+            "embedding": embedding
+        }
+class PriceIn(BaseModel):
+    id: int
+    price: float
 
-    return ProduktResponse(
-        id_produktu=produkt.id_produktu,
-        nazwa=produkt.nazwa,
-        cena=cena
+@app.post("/product/add-price")
+def add_or_update_price(price_data: PriceIn):
+    stmt = insert(prices).values(id=price_data.id, price=price_data.price)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[prices.c.id],
+        set_={"price": price_data.price}
     )
-#po nazwie
-@app.get("/produkty/nazwa/{nazwa_produktu}", response_model=ProduktResponse)
-def get_produkt(nazwa_produktu: str, db: Session = Depends(get_db)):
-    produkt = db.query(Produkt).filter(Produkt.nazwa == nazwa_produktu).first()
-    if produkt is None:
-        raise HTTPException(status_code=404, detail="Produkt nie znaleziony")
-    
-    cena_row = db.query(Cena.cena).filter(Cena.produkt_id == produkt.id_produktu).first()
-    
-    if cena_row is None:
-        raise HTTPException(status_code=404, detail="Cena nie znaleziona")
-    
-    cena = cena_row[0]  # 🔹 Wyciągamy liczbę float z krotki
 
-    return ProduktResponse(
-        id_produktu=produkt.id_produktu,
-        nazwa=produkt.nazwa,
-        cena=cena
-    )
+    with engine.connect() as conn:
+        conn.execute(stmt)
+        conn.commit()
 
-# Dodaj nowy produkt
-@app.post("/produkty")
-def create_produkt(produkt: ProduktSchema, db: Session = Depends(get_db)):
-    # Tworzenie nowego produktu
-    nowy_produkt = Produkt(nazwa=produkt.nazwa)
-    
-    # Tworzenie nowej ceny i przypisanie jej do produktu
-    nowa_cena = Cena(cena=produkt.cena, produkt=nowy_produkt)  # relacja z produktem
-    
-    # Dodanie produktu i ceny do sesji bazy danych
-    db.add(nowy_produkt)
-    db.add(nowa_cena)
-    
-    # Zatwierdzenie zmian
-    db.commit()
-    
-    # Odświeżenie obiektów, aby uzyskać zaktualizowane dane
-    db.refresh(nowy_produkt)
-    db.refresh(nowa_cena)
-    
-    return nowy_produkt
+    return {
+        "id": price_data.id,
+        "price": price_data.price,
+        "status": "updated or inserted"
+    }
+class ProductIn(BaseModel):
+    name: str
+    price: float
+    description: Optional[str] = None
+    embedding: Optional[list[float]] = None
+@app.post("/product/add-product")
+def add_or_update_product(product_data: ProductIn):
+    if product_data.embedding is None:
+        batch_size = 384
+        model = SentenceTransformer(
+            model_name_or_path="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        if (product_data.description is None):
+            print('embedding from name')
+            embedding = model.encode(product_data.name, batch_size=batch_size)
+        else:
+            print('embedding from description')
+            embedding = embedding = model.encode(product_data.description, batch_size=batch_size)
 
-@app.delete("/produkty/{produkt_id}")
-def delete_produkt(produkt_id: int, db: Session = Depends(get_db)):
-    produkt = db.query(Produkt).filter(Produkt.id == produkt_id).first()
-    if produkt is None:
-        raise HTTPException(status_code=404, detail="Produkt nie znaleziony")
-    db.delete(produkt)
-    db.commit()
-    return {"message": "Produkt usunięty"}
+        embedding = embedding.tolist()
+    else:
+        embedding = product_data.embedding
+
+    with engine.connect() as conn:
+        product_result = conn.execute(
+            text("INSERT INTO products (name, embedding, description) VALUES (:name, :embedding, :description) RETURNING id"),
+            {"name": product_data.name, "embedding": embedding, "description": product_data.description}
+        )
+        new_id = product_result.scalar()
+        conn.execute(
+                text("""
+                    INSERT INTO prices (id, price)
+                    VALUES (:id, :price)
+                """),
+                {"id": new_id, "price": product_data.price}
+            )
+        conn.commit()
+
+    return {
+        "id": new_id,
+        "name": product_data.name,
+        "status": "inserted"
+    }

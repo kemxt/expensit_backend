@@ -132,7 +132,6 @@ async def search_in_category(
             query_filter=Filter(must=filters),
             limit=query.limit
         )
-
         return [
             {
                 "id": hit.id,
