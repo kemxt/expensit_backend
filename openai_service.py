@@ -23,7 +23,7 @@ router = APIRouter()
 load_dotenv()
 
 app = FastAPI()
-app.include_router(router=router, prefix='/openai')
+
 
 class EmbeddingRequest(BaseModel):
     text: str
@@ -112,7 +112,7 @@ async def analyze_image(
 
        
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
-        if len(base64_image) > 20 * 1024 * 1024:  # 20MB limit
+        if len(base64_image) > 20 * 1024 * 1024: 
             return JSONResponse(
                 status_code=400,
                 content={"status": "error", "message": "Image too large (max 20MB)"}
@@ -139,6 +139,7 @@ async def analyze_image(
        
         payload = {
             "model": "gpt-4o",
+            "response_format":{ "type": "json_object" },
             "messages": [
                 {
                     "role": "user",
