@@ -30,7 +30,7 @@ receipts = Table("receipts", metadata,
     Column("id", Integer, primary_key=True),
     Column("store_name", String),
     Column("document_type", String),
-    Column("category", String),
+    
     Column("payment_method", String),
     Column("total_amount", Float),
     Column("purchase_date", DateTime),
@@ -45,41 +45,49 @@ receipt_products = Table("receipt_products", metadata,
     Column("quantity", Integer),
     Column("unit_price", Float),
     Column("total_price", Float),
-    Column("category", String),
     Column("created_at", DateTime, default=datetime.utcnow),
     extend_existing=True
 )
 
 # Utworzenie tabel jeśli nie istnieją
 metadata.create_all(engine)
+class ProductIn(BaseModel):
+    name: str
+    price: float
+    description: Optional[str] = None
+    embedding: Optional[list[float]] = None
 
 # Modele Pydantic
-class ReceiptProduct(BaseModel):
-    product_name: str
+class ReceiptProductIn(BaseModel):
+    product_id: int
+    receipt_id: int
     quantity: int
     unit_price: float
     total_price: float
-    category: str
-
+    purchase_date: datetime
 class ReceiptData(BaseModel):
     store_name: str
     document_type: str
-    category: Optional[str] = None
     payment_method: Optional[str] = None
     total_amount: float
     purchase_date: str  
     created_at: datetime = Field(default_factory=datetime.utcnow)
-    products: List[ReceiptProduct]
-
+    products: List[ReceiptProductIn]
+class ReceiptProductWithProductIn(BaseModel):
+    receipt_id: int
+    quantity: int
+    unit_price: float
+    total_price: float
+    purchase_date: datetime
+    product: ProductIn
 class ReceiptResponse(BaseModel):
     id: int
     store_name: str
     document_type: str
-    category: Optional[str]
     payment_method: Optional[str]
     total_amount: float
     purchase_date: datetime
-    products: List[ReceiptProduct]
+    products: List[ReceiptProductIn]
     
 
 def get_db():
@@ -341,14 +349,14 @@ def add_receipt(receipt_data: ReceiptData):
             # Dodanie paragonu
             receipt_result = conn.execute(
                 text("""
-                    INSERT INTO receipts (store_name, document_type, category, payment_method, total_amount, purchase_date)
-                    VALUES (:store_name, :document_type, :category, :payment_method, :total_amount, :purchase_date)
+                    INSERT INTO receipts (store_name, document_type, payment_method, total_amount, purchase_date)
+                    VALUES (:store_name, :document_type, :payment_method, :total_amount, :purchase_date)
                     RETURNING id, created_at
                 """),
                 {
                     "store_name": receipt_data.store_name,
                     "document_type": receipt_data.document_type,
-                    "category": receipt_data.category,
+                   
                     "payment_method": receipt_data.payment_method,
                     "total_amount": receipt_data.total_amount,
                     "purchase_date": purchase_date
@@ -364,8 +372,8 @@ def add_receipt(receipt_data: ReceiptData):
             for product in receipt_data.products:
                 conn.execute(
                     text("""
-                        INSERT INTO receipt_products (receipt_id, product_name, quantity, unit_price, total_price, category)
-                        VALUES (:receipt_id, :product_name, :quantity, :unit_price, :total_price, :category)
+                        INSERT INTO receipt_products (receipt_id, product_name, quantity, unit_price, total_price )
+                        VALUES (:receipt_id, :product_name, :quantity, :unit_price, :total_price)
                     """),
                     {
                         "receipt_id": receipt_id,
@@ -373,17 +381,18 @@ def add_receipt(receipt_data: ReceiptData):
                         "quantity": product.quantity,
                         "unit_price": product.unit_price,
                         "total_price": product.total_price,
-                        "category": product.category
+                       
                     }
                 )
             
             conn.commit()
+           
             
             return ReceiptResponse(
                 id=receipt_id,
                 store_name=receipt_data.store_name,
                 document_type=receipt_data.document_type,
-                category=receipt_data.category,
+                
                 payment_method=receipt_data.payment_method,
                 total_amount=receipt_data.total_amount,
                 purchase_date=purchase_date,
@@ -411,12 +420,11 @@ def get_receipts(limit: int = 50, offset: int = 0):
             products_result = conn.execute(products_stmt)
             
             products_list = [
-                ReceiptProduct(
-                    product_name=product_row.product_name,
-                    quantity=product_row.quantity,
-                    unit_price=product_row.unit_price,
-                    total_price=product_row.total_price,
-                    category=product_row.category
+                ProductResponse(
+                    name=product_row.product_name,
+                    price=product_row.unit_price,
+                    description=product_row.description,
+                    embedding=product_row.embedding
                 )
                 for product_row in products_result
             ]
@@ -425,12 +433,12 @@ def get_receipts(limit: int = 50, offset: int = 0):
                 id=receipt_row.id,
                 store_name=receipt_row.store_name,
                 document_type=receipt_row.document_type,
-                category=receipt_row.category,
+                
                 payment_method=receipt_row.payment_method,
                 total_amount=receipt_row.total_amount,
                 purchase_date=receipt_row.purchase_date,
                 products=products_list,
-                created_at=receipt_row.created_at
+                
             ))
         
         return receipt_list
@@ -453,12 +461,17 @@ def get_receipt(receipt_id: int):
         products_result = conn.execute(products_stmt)
         
         products_list = [
-            ReceiptProduct(
-                product_name=product_row.product_name,
+            ReceiptProductWithProductIn(
+                product=ProductResponse(
+                    name=product_row.product_name,
+                    price=product_row.unit_price,
+                    description=product_row.description,
+                    embedding=product_row.embedding
+                ),
                 quantity=product_row.quantity,
                 unit_price=product_row.unit_price,
                 total_price=product_row.total_price,
-                category=product_row.category
+                
             )
             for product_row in products_result
         ]
@@ -467,7 +480,7 @@ def get_receipt(receipt_id: int):
             id=receipt_result.id,
             store_name=receipt_result.store_name,
             document_type=receipt_result.document_type,
-            category=receipt_result.category,
+            
             payment_method=receipt_result.payment_method,
             total_amount=receipt_result.total_amount,
             purchase_date=receipt_result.purchase_date,
