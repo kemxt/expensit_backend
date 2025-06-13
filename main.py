@@ -422,7 +422,7 @@ def get_receipts(limit: int = 50, offset: int = 0):
             products_stmt = (
     select(receipt_products, products)
     .select_from(
-        receipt_products.join(products, receipt_products.c.product_id == products.c.id)
+        receipt_products.join(products, receipt_products.product_id == products.id)
     )
     .where(receipt_products.c.receipt_id == receipt_row.id)
 )
