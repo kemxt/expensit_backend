@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, MetaData, Table, desc, text, Column, Integer, String, Float, DateTime, ForeignKey
-from sqlalchemy.sql import select
+from sqlalchemy.sql import select, join
 from sqlalchemy.dialects.postgresql import insert
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.orm import sessionmaker
@@ -419,14 +419,20 @@ def get_receipts(limit: int = 50, offset: int = 0):
         receipt_list = []
         for receipt_row in receipts_result:
             # Pobieranie produktów dla każdego paragonu
-            products_stmt = select(receipt_products).where(receipt_products.c.receipt_id == receipt_row.id)
+            products_stmt = (
+    select(receipt_products, products)
+    .select_from(
+        receipt_products.join(products, receipt_products.c.product_id == products.c.id)
+    )
+    .where(receipt_products.c.receipt_id == receipt_row.id)
+)
+
             products_result = conn.execute(products_stmt)
             
             products_list = [
                 ProductResponse(
                     name=product_row.product_name,
                     price=product_row.unit_price,
-                    
                     embedding=product_row.embedding
                 )
                 for product_row in products_result
