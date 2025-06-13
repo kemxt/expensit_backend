@@ -30,7 +30,6 @@ receipts = Table("receipts", metadata,
     Column("id", Integer, primary_key=True),
     Column("store_name", String),
     Column("document_type", String),
-    
     Column("payment_method", String),
     Column("total_amount", Float),
     Column("purchase_date", DateTime),
@@ -58,21 +57,20 @@ class ProductIn(BaseModel):
     embedding: Optional[list[float]] = None
 
 # Modele Pydantic
-class ReceiptProductIn(BaseModel):
-    product_id: int
-    receipt_id: int
+class ReceiptProductCreate(BaseModel):
     quantity: int
     unit_price: float
     total_price: float
-    purchase_date: datetime
+    purchase_date: Optional[datetime] = None
+    product_name: Optional[str] = None
 class ReceiptData(BaseModel):
     store_name: str
     document_type: str
     payment_method: Optional[str] = None
     total_amount: float
-    purchase_date: str  
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    products: List[ReceiptProductIn]
+    purchase_date: datetime
+    products: List[ReceiptProductCreate]
+
 class ReceiptProductWithProductIn(BaseModel):
     receipt_id: int
     quantity: int
@@ -336,17 +334,16 @@ def add_products_bulk(products_data: list[ProductIn]):
 
 # NOWE ENDPOINTY DLA PARAGONÓW
 
+from fastapi import HTTPException
+from sqlalchemy import text
+
 @app.post("/receipt/add", response_model=ReceiptResponse)
 def add_receipt(receipt_data: ReceiptData):
-    """
-    Dodaje paragon z listą produktów do bazy danych
-    """
     try:
         with engine.connect() as conn:
-            # Parsowanie daty
             purchase_date = parse_date_string(receipt_data.purchase_date)
-            
-            # Dodanie paragonu
+
+            # Insert paragon i zwróć id i created_at
             receipt_result = conn.execute(
                 text("""
                     INSERT INTO receipts (store_name, document_type, payment_method, total_amount, purchase_date)
@@ -356,24 +353,22 @@ def add_receipt(receipt_data: ReceiptData):
                 {
                     "store_name": receipt_data.store_name,
                     "document_type": receipt_data.document_type,
-                   
                     "payment_method": receipt_data.payment_method,
                     "total_amount": receipt_data.total_amount,
                     "purchase_date": purchase_date
                 }
             )
-
-
             receipt_row = receipt_result.first()
             receipt_id = receipt_row.id
-            
-            conn.commit()
-            # Dodanie produktów
+            created_at = receipt_row.created_at
+
+            # Dodaj produkty, uwzględniając purchase_date z paragonu
             for product in receipt_data.products:
                 conn.execute(
                     text("""
-                        INSERT INTO receipt_products (receipt_id, product_name, quantity, unit_price, total_price )
-                        VALUES (:receipt_id, :product_name, :quantity, :unit_price, :total_price)
+                        INSERT INTO receipt_products 
+                        (receipt_id, product_name, quantity, unit_price, total_price, purchase_date)
+                        VALUES (:receipt_id, :product_name, :quantity, :unit_price, :total_price, :purchase_date)
                     """),
                     {
                         "receipt_id": receipt_id,
@@ -381,25 +376,35 @@ def add_receipt(receipt_data: ReceiptData):
                         "quantity": product.quantity,
                         "unit_price": product.unit_price,
                         "total_price": product.total_price,
-                       
+                        "purchase_date": purchase_date
                     }
                 )
-            
+
             conn.commit()
-           
-            
+
+            # Przygotuj response products z dodanym receipt_id i purchase_date, product_id pomiń lub ustaw None
+            response_products = [
+                ReceiptProductCreate(
+                    product_id=0,  # jeśli masz autoincrement, możesz rozszerzyć o zwracanie id po insertach
+                    receipt_id=receipt_id,
+                    quantity=prod.quantity,
+                    unit_price=prod.unit_price,
+                    total_price=prod.total_price,
+                    purchase_date=purchase_date
+                )
+                for prod in receipt_data.products
+            ]
+
             return ReceiptResponse(
                 id=receipt_id,
                 store_name=receipt_data.store_name,
                 document_type=receipt_data.document_type,
-                
                 payment_method=receipt_data.payment_method,
                 total_amount=receipt_data.total_amount,
                 purchase_date=purchase_date,
-                products=receipt_data.products,
-                
+                products=response_products,
             )
-            
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error adding receipt: {str(e)}")
 
