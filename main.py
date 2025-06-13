@@ -385,12 +385,13 @@ def add_receipt(receipt_data: ReceiptData):
             # Przygotuj response products z dodanym receipt_id i purchase_date, product_id pomiń lub ustaw None
             response_products = [
                 ReceiptProductCreate(
-                    product_id=0,  # jeśli masz autoincrement, możesz rozszerzyć o zwracanie id po insertach
+                    product_id=0, 
                     receipt_id=receipt_id,
                     quantity=prod.quantity,
                     unit_price=prod.unit_price,
                     total_price=prod.total_price,
-                    purchase_date=purchase_date
+                    purchase_date=purchase_date,
+                    product_name=prod.product_name
                 )
                 for prod in receipt_data.products
             ]
