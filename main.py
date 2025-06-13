@@ -419,24 +419,27 @@ def get_receipts(limit: int = 50, offset: int = 0):
         receipt_list = []
         for receipt_row in receipts_result:
             # Pobieranie produktów dla każdego paragonu
-            products_stmt = (
+            stmt = (
     select(receipt_products, products)
     .select_from(
-        receipt_products.join(products, receipt_products.product_id == products.id)
+        receipt_products.join(products, receipt_products.c.product_id == products.c.id)
     )
     .where(receipt_products.c.receipt_id == receipt_row.id)
 )
 
-            products_result = conn.execute(products_stmt)
+            products_result = conn.execute(stmt)
             
-            products_list = [
-                ProductResponse(
-                    name=product_row.product_name,
-                    price=product_row.unit_price,
-                    embedding=product_row.embedding
-                )
-                for product_row in products_result
-            ]
+            products_list = []
+            for row in products_result:
+                product_name = row[products.c.name]
+                price = row[products.c.price]
+                embedding = row[products.c.embedding]
+
+                products_list.append(ProductResponse(
+                    name=product_name,
+                    price=price,
+                    embedding=embedding
+                ))
             
             receipt_list.append(ReceiptResponse(
                 id=receipt_row.id,
