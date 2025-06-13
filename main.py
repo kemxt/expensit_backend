@@ -411,14 +411,11 @@ def add_receipt(receipt_data: ReceiptData):
 
 @app.get("/receipts", response_model=List[ReceiptResponse])
 def get_receipts(limit: int = 50, offset: int = 0):
-    """
-    Pobiera listę paragonów z produktami
-    """
+
     with engine.connect() as conn:
         # Pobieranie paragonów
         receipts_stmt = select(receipts).order_by(desc(receipts.c.created_at)).limit(limit).offset(offset)
         receipts_result = conn.execute(receipts_stmt)
-        
         receipt_list = []
         for receipt_row in receipts_result:
             # Pobieranie produktów dla każdego paragonu
@@ -429,7 +426,7 @@ def get_receipts(limit: int = 50, offset: int = 0):
                 ProductResponse(
                     name=product_row.product_name,
                     price=product_row.unit_price,
-                    description=product_row.description,
+                    
                     embedding=product_row.embedding
                 )
                 for product_row in products_result
