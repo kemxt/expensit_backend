@@ -85,7 +85,7 @@ class ReceiptResponse(BaseModel):
     payment_method: Optional[str]
     total_amount: float
     purchase_date: datetime
-    products: List[ReceiptProductIn]
+    products: List[ReceiptProductCreate]
     
 
 def get_db():
