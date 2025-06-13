@@ -429,17 +429,18 @@ def get_receipts(limit: int = 50, offset: int = 0):
 
             products_result = conn.execute(stmt)
             
-            products_list = []
-            for row in products_result:
-                product_name = row[products.c.name]
-                price = row[products.c.price]
-                embedding = row[products.c.embedding]
+            products_list = [
+                    ReceiptProductCreate(
+                        product_name=product_row.product_name,
+                        quantity=product_row.quantity,
+                        unit_price=product_row.unit_price,
+                        total_price=product_row.total_price,
+                        purchase_date=product_row.purchase_date,
+                    )
+                    for product_row in products_result
+                ]
 
-                products_list.append(ProductResponse(
-                    name=product_name,
-                    price=price,
-                    embedding=embedding
-                ))
+            
             
             receipt_list.append(ReceiptResponse(
                 id=receipt_row.id,
