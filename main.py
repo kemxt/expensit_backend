@@ -10,6 +10,8 @@ from sqlalchemy.dialects.postgresql import insert
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.orm import sessionmaker
 import os
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 from openai_service import router as openai_router
 
 app = FastAPI()
@@ -40,7 +42,7 @@ receipts = Table("receipts", metadata,
 receipt_products = Table("receipt_products", metadata,
     Column("id", Integer, primary_key=True),
     Column("receipt_id", Integer, ForeignKey("receipts.id")),
-    Column("product_id", Integer),
+    Column("product_id", Integer, ForeignKey("products.id")),  # Dodany ForeignKey
     Column("product_name", String),
     Column("quantity", Integer),
     Column("unit_price", Float),
@@ -51,6 +53,7 @@ receipt_products = Table("receipt_products", metadata,
 
 # Utworzenie tabel jeśli nie istnieją
 metadata.create_all(engine)
+
 class ProductIn(BaseModel):
     name: str
     price: float
@@ -59,11 +62,13 @@ class ProductIn(BaseModel):
 
 # Modele Pydantic
 class ReceiptProductCreate(BaseModel):
+    product_id: Optional[int] = None  # Dodane pole
     quantity: int
     unit_price: float
     total_price: float
     purchase_date: Optional[datetime] = None
     product_name: Optional[str] = None
+
 class ReceiptData(BaseModel):
     store_name: str
     document_type: str
@@ -79,6 +84,7 @@ class ReceiptProductWithProductIn(BaseModel):
     total_price: float
     purchase_date: datetime
     product: ProductIn
+
 class ReceiptResponse(BaseModel):
     id: int
     store_name: str
@@ -95,6 +101,7 @@ def get_db():
         yield db
     finally:
         db.close()
+
 # Istniejące modele
 class ProductResponse(BaseModel):
     id: int
@@ -119,11 +126,122 @@ class PriceIn(BaseModel):
     id: int
     price: float
 
-class ProductIn(BaseModel):
-    name: str
-    price: float
-    description: Optional[str] = None
-    embedding: Optional[list[float]] = None
+# Nowa funkcja do znajdowania podobnych produktów
+def find_similar_product(product_name: str, product_description: Optional[str], threshold: float = 0.95):
+    """
+    Znajduje podobny produkt w bazie danych na podstawie embeddingów
+    
+    Args:
+        product_name: nazwa produktu
+        product_description: opis produktu (opcjonalny)
+        threshold: próg podobieństwa (domyślnie 95%)
+    
+    Returns:
+        tuple: (product_id, similarity_score) lub (None, 0) jeśli nie znaleziono
+    """
+    try:
+        # Inicjalizuj model do embeddingów
+        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        
+        # Utworz embedding dla nowego produktu
+        text_to_embed = product_description if product_description else product_name
+        new_embedding = model.encode(text_to_embed, batch_size=384).tolist()
+        
+        # Pobierz wszystkie produkty z embeddingami
+        with engine.connect() as conn:
+            stmt = select(products.c.id, products.c.name, products.c.embedding)
+            result = conn.execute(stmt)
+            
+            best_match_id = None
+            best_similarity = 0.0
+            
+            for row in result:
+                existing_embedding = row.embedding
+                
+                # Parsuj embedding jeśli jest w formacie string
+                if isinstance(existing_embedding, str):
+                    try:
+                        existing_embedding = json.loads(existing_embedding)
+                    except json.JSONDecodeError:
+                        continue
+                
+                if existing_embedding and len(existing_embedding) == len(new_embedding):
+                    # Oblicz podobieństwo cosinusowe
+                    similarity = cosine_similarity(
+                        [new_embedding], 
+                        [existing_embedding]
+                    )[0][0]
+                    
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_match_id = row.id
+            
+            # Zwróć wynik jeśli podobieństwo przekracza próg
+            if best_similarity >= threshold:
+                return best_match_id, best_similarity
+            else:
+                return None, best_similarity
+                
+    except Exception as e:
+        print(f"Error in find_similar_product: {e}")
+        return None, 0.0
+
+def create_or_update_product(product_name: str, unit_price: float, product_description: Optional[str] = None):
+    """
+    Tworzy nowy produkt lub aktualizuje istniejący na podstawie podobieństwa embeddingów
+    
+    Returns:
+        int: product_id (nowego lub istniejącego produktu)
+    """
+    # Sprawdź czy istnieje podobny produkt
+    similar_product_id, similarity = find_similar_product(product_name, product_description)
+    
+    with engine.connect() as conn:
+        if similar_product_id and similarity >= 0.95:
+            print(f"Found similar product (ID: {similar_product_id}, similarity: {similarity:.3f}) for '{product_name}'")
+            
+            # Aktualizuj cenę istniejącego produktu jeśli jest różna
+            current_price_result = conn.execute(
+                select(prices.c.price).where(prices.c.id == similar_product_id)
+            ).first()
+            
+            if current_price_result and current_price_result.price != unit_price:
+                # Aktualizuj cenę
+                conn.execute(
+                    text("UPDATE prices SET price = :price WHERE id = :id"),
+                    {"price": unit_price, "id": similar_product_id}
+                )
+                print(f"Updated price for product ID {similar_product_id}: {current_price_result.price} -> {unit_price}")
+            
+            conn.commit()
+            return similar_product_id
+        else:
+            print(f"Creating new product '{product_name}' (best similarity: {similarity:.3f})")
+            
+            # Utwórz embedding dla nowego produktu
+            model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            text_to_embed = product_description if product_description else product_name
+            embedding = model.encode(text_to_embed, batch_size=384).tolist()
+            
+            # Dodaj nowy produkt
+            product_result = conn.execute(
+                text("INSERT INTO products (name, embedding, description) VALUES (:name, :embedding, :description) RETURNING id"),
+                {
+                    "name": product_name, 
+                    "embedding": embedding, 
+                    "description": product_description
+                }
+            )
+            new_product_id = product_result.scalar()
+            
+            # Dodaj cenę
+            conn.execute(
+                text("INSERT INTO prices (id, price) VALUES (:id, :price)"),
+                {"id": new_product_id, "price": unit_price}
+            )
+            
+            conn.commit()
+            return new_product_id
 
 # Funkcja pomocnicza do parsowania daty
 def parse_date_string(date_str: str) -> datetime:
@@ -253,12 +371,12 @@ def add_or_update_product(product_data: ProductIn):
         )
         new_id = product_result.scalar()
         conn.execute(
-                text("""
-                    INSERT INTO prices (id, price)
-                    VALUES (:id, :price)
-                """),
-                {"id": new_id, "price": product_data.price}
-            )
+            text("""
+                INSERT INTO prices (id, price)
+                VALUES (:id, :price)
+            """),
+            {"id": new_id, "price": product_data.price}
+        )
         conn.commit()
 
     return {
@@ -333,18 +451,17 @@ def add_products_bulk(products_data: list[ProductIn]):
         "results": results
     }
 
-# NOWE ENDPOINTY DLA PARAGONÓW
-
-from fastapi import HTTPException
-from sqlalchemy import text
+# ZMODYFIKOWANE ENDPOINTY DLA PARAGONÓW
 
 @app.post("/receipt/add", response_model=ReceiptResponse)
 def add_receipt(receipt_data: ReceiptData):
     try:
         with engine.connect() as conn:
-            purchase_date = parse_date_string(receipt_data.purchase_date)
+            purchase_date = receipt_data.purchase_date
+            if isinstance(purchase_date, str):
+                purchase_date = parse_date_string(purchase_date)
 
-            # Insert paragon i zwróć id i created_at
+            # Insert paragon
             receipt_result = conn.execute(
                 text("""
                     INSERT INTO receipts (store_name, document_type, payment_method, total_amount, purchase_date)
@@ -361,41 +478,46 @@ def add_receipt(receipt_data: ReceiptData):
             )
             receipt_row = receipt_result.first()
             receipt_id = receipt_row.id
-            created_at = receipt_row.created_at
 
-            # Dodaj produkty, uwzględniając purchase_date z paragonu
+            # Przetwórz każdy produkt z paragonu
+            response_products = []
             for product in receipt_data.products:
+                # Znajdź lub utwórz produkt
+                product_id = create_or_update_product(
+                    product_name=product.product_name,
+                    unit_price=product.unit_price,
+                    product_description=None  # Możesz dodać opis jeśli jest dostępny
+                )
+                
+                # Dodaj produkt do receipt_products z product_id
                 conn.execute(
                     text("""
                         INSERT INTO receipt_products 
-                        (receipt_id, product_name, quantity, unit_price, total_price, purchase_date)
-                        VALUES (:receipt_id, :product_name, :quantity, :unit_price, :total_price, :purchase_date)
+                        (receipt_id, product_id, product_name, quantity, unit_price, total_price)
+                        VALUES (:receipt_id, :product_id, :product_name, :quantity, :unit_price, :total_price)
                     """),
                     {
                         "receipt_id": receipt_id,
+                        "product_id": product_id,
                         "product_name": product.product_name,
                         "quantity": product.quantity,
                         "unit_price": product.unit_price,
-                        "total_price": product.total_price,
-                        "purchase_date": purchase_date
+                        "total_price": product.total_price
                     }
+                )
+                
+                response_products.append(
+                    ReceiptProductCreate(
+                        product_id=product_id,
+                        quantity=product.quantity,
+                        unit_price=product.unit_price,
+                        total_price=product.total_price,
+                        purchase_date=purchase_date,
+                        product_name=product.product_name
+                    )
                 )
 
             conn.commit()
-
-            # Przygotuj response products z dodanym receipt_id i purchase_date, product_id pomiń lub ustaw None
-            response_products = [
-                ReceiptProductCreate(
-                    product_id=0, 
-                    receipt_id=receipt_id,
-                    quantity=prod.quantity,
-                    unit_price=prod.unit_price,
-                    total_price=prod.total_price,
-                    purchase_date=purchase_date,
-                    product_name=prod.product_name
-                )
-                for prod in receipt_data.products
-            ]
 
             return ReceiptResponse(
                 id=receipt_id,
@@ -412,47 +534,44 @@ def add_receipt(receipt_data: ReceiptData):
 
 @app.get("/receipts", response_model=List[ReceiptResponse])
 def get_receipts(limit: int = 50, offset: int = 0):
-
     with engine.connect() as conn:
         # Pobieranie paragonów
         receipts_stmt = select(receipts).order_by(desc(receipts.c.created_at)).limit(limit).offset(offset)
         receipts_result = conn.execute(receipts_stmt)
         receipt_list = []
+        
         for receipt_row in receipts_result:
-            # Pobieranie produktów dla każdego paragonu
-            stmt = (
-    select(receipt_products, products)
-    .select_from(
-        receipt_products.join(products, receipt_products.c.product_id == products.c.id)
-    )
-    .where(receipt_products.c.receipt_id == receipt_row.id)
-)
-
-            products_result = conn.execute(stmt)
+            # Pobieranie produktów dla każdego paragonu z JOIN do products
+            products_stmt = select(
+                receipt_products.c.product_id,
+                receipt_products.c.product_name,
+                receipt_products.c.quantity,
+                receipt_products.c.unit_price,
+                receipt_products.c.total_price,
+                receipt_products.c.created_at
+            ).where(receipt_products.c.receipt_id == receipt_row.id)
             
+            products_result = conn.execute(products_stmt)
             products_list = [
-                    ReceiptProductCreate(
-                        product_name=product_row.product_name,
-                        quantity=product_row.quantity,
-                        unit_price=product_row.unit_price,
-                        total_price=product_row.total_price,
-                        purchase_date=product_row.purchase_date,
-                    )
-                    for product_row in products_result
-                ]
-
-            
+                ReceiptProductCreate(
+                    product_id=product_row.product_id,
+                    product_name=product_row.product_name,
+                    quantity=product_row.quantity,
+                    unit_price=product_row.unit_price,
+                    total_price=product_row.total_price,
+                    purchase_date=receipt_row.purchase_date,
+                )
+                for product_row in products_result
+            ]
             
             receipt_list.append(ReceiptResponse(
                 id=receipt_row.id,
                 store_name=receipt_row.store_name,
                 document_type=receipt_row.document_type,
-                
                 payment_method=receipt_row.payment_method,
                 total_amount=receipt_row.total_amount,
                 purchase_date=receipt_row.purchase_date,
                 products=products_list,
-                
             ))
         
         return receipt_list
@@ -470,22 +589,25 @@ def get_receipt(receipt_id: int):
         if not receipt_result:
             raise HTTPException(status_code=404, detail="Receipt not found")
         
-        # Pobieranie produktów
-        products_stmt = select(receipt_products).where(receipt_products.c.receipt_id == receipt_id)
+        # Pobieranie produktów z receipt_products z informacjami o produkcie
+        products_stmt = select(
+            receipt_products.c.product_id,
+            receipt_products.c.product_name,
+            receipt_products.c.quantity,
+            receipt_products.c.unit_price,
+            receipt_products.c.total_price,
+        ).where(receipt_products.c.receipt_id == receipt_id)
+        
         products_result = conn.execute(products_stmt)
         
         products_list = [
-            ReceiptProductWithProductIn(
-                product=ProductResponse(
-                    name=product_row.product_name,
-                    price=product_row.unit_price,
-                    description=product_row.description,
-                    embedding=product_row.embedding
-                ),
+            ReceiptProductCreate(
+                product_id=product_row.product_id,
+                product_name=product_row.product_name,
                 quantity=product_row.quantity,
                 unit_price=product_row.unit_price,
                 total_price=product_row.total_price,
-                
+                purchase_date=receipt_result.purchase_date,
             )
             for product_row in products_result
         ]
@@ -494,10 +616,8 @@ def get_receipt(receipt_id: int):
             id=receipt_result.id,
             store_name=receipt_result.store_name,
             document_type=receipt_result.document_type,
-            
             payment_method=receipt_result.payment_method,
             total_amount=receipt_result.total_amount,
             purchase_date=receipt_result.purchase_date,
             products=products_list,
-            created_at=receipt_result.created_at
         )

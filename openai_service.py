@@ -45,7 +45,6 @@ async def verify_firebase_token(authorization: Optional[str] = Header(None)):
     
     token = authorization.split("Bearer ")[1]
     try:
-      
         decoded_token = auth.verify_id_token(token)
         return decoded_token
     except Exception as e:
