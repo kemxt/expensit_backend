@@ -51,14 +51,6 @@ async def verify_firebase_token(authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
 
-async def compress_image(image_path: str) -> bytes:
-    """Compress image and return as bytes"""
-    with Image.open(image_path) as img:
-        if img.mode in ('RGBA', 'P'):
-            img = img.convert('RGB')
-        output_buffer = BytesIO()
-        img.save(output_buffer, format="JPEG", quality=85)
-        return output_buffer.getvalue()
 
 @router.post("/analyze-image")
 async def analyze_image(
@@ -66,7 +58,6 @@ async def analyze_image(
     user_token: dict = Depends(verify_firebase_token)
 ):
     try:
-       
         user_id = user_token["uid"]
         image_path = image_data["image_path"].strip().lstrip('/')
 
@@ -137,7 +128,7 @@ async def analyze_image(
 
        
         payload = {
-            "model": "gpt-4o",
+            "model": "gpt-4.1-mini",
             "response_format":{ "type": "json_object" },
             "messages": [
                 {
