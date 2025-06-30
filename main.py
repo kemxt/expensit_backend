@@ -482,11 +482,12 @@ def add_receipt(receipt_data: ReceiptData):
             # Przetwórz każdy produkt z paragonu
             response_products = []
             for product in receipt_data.products:
-                # Znajdź lub utwórz produkt
+                print("produkt:")
+                print(product.product_name)
                 product_id = create_or_update_product(
                     product_name=product.product_name,
                     unit_price=product.unit_price,
-                    product_description=None  # Możesz dodać opis jeśli jest dostępny
+                    product_description=None  
                 )
                 
                 # Dodaj produkt do receipt_products z product_id
