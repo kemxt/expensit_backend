@@ -128,8 +128,8 @@ async def analyze_image(
 
        
         payload = {
-            "model": "gpt-4.1-mini",
-            "response_format":{ "type": "json_object" },
+            "model": "gpt-4o",
+            "response_format":"json",
             "messages": [
                 {
                     "role": "user",
