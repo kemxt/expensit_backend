@@ -73,93 +73,83 @@ async def analyze_image(
                 content={"status": "error", "message": "Access denied"}
             )
 
-       
         bucket = storage.bucket('expensit-10546.appspot.com')
         blob = bucket.blob(image_path)
-        
+
         if not blob.exists():
             return JSONResponse(
                 status_code=404,
                 content={"status": "error", "message": "Image not found"}
             )
 
-        
         image_bytes = blob.download_as_bytes()
-        
-        #
+
+        # Weryfikacja poprawności formatu
         try:
             img = Image.open(io.BytesIO(image_bytes))
             if img.format.lower() not in ('jpeg', 'jpg'):
-                img = img.convert('RGB')
-            output = io.BytesIO()
-            img.save(output, format='JPEG', quality=95)
-            image_bytes = output.getvalue()
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": "Image format not JPEG/JPG"}
+                )
         except Exception as img_error:
             return JSONResponse(
                 status_code=400,
                 content={"status": "error", "message": f"Invalid image: {str(img_error)}"}
             )
 
-       
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
-        if len(base64_image) > 20 * 1024 * 1024: 
+        if len(base64_image) > 20 * 1024 * 1024:
             return JSONResponse(
                 status_code=400,
                 content={"status": "error", "message": "Image too large (max 20MB)"}
             )
 
-        
         headers = {
             "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
             "Content-Type": "application/json; charset=utf-8"
         }
-        
+
         models_response = requests.get(
             "https://api.openai.com/v1/models",
             headers=headers,
             timeout=10
         )
-        
+
         if "gpt-4o" not in [m['id'] for m in models_response.json().get('data', [])]:
             return JSONResponse(
                 status_code=400,
                 content={"status": "error", "message": "GPT-4o not available with this API key"}
             )
 
-       
         payload = {
             "model": "gpt-4o",
-            "response_format":{ "type": "json_object" },
+            "response_format": { "type": "json_object" },
             "messages": [
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "text", 
+                            "type": "text",
                             "text": os.getenv('GPT_PROMPT')
                         },
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}",
-                               
+                                "url": f"data:image/jpeg;base64,{base64_image}"
                             }
                         }
                     ]
                 }
-            ],
-            
+            ]
         }
 
-        
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
-            json=payload,
-            
+            json=payload
         )
 
-       
         response.raise_for_status()
         return JSONResponse(
             status_code=200,
@@ -168,13 +158,11 @@ async def analyze_image(
                 "analysis": response.json()['choices'][0]['message']['content']
             }
         )
-            
+
     except requests.exceptions.HTTPError as http_err:
-       
         content_types = [
             str(item["type"]) for item in payload["messages"][0]["content"]
         ]
-        
         return JSONResponse(
             status_code=http_err.response.status_code,
             content={
@@ -185,7 +173,7 @@ async def analyze_image(
                     "image_size_kb": len(image_bytes) / 1024,
                     "base64_length": len(base64_image),
                     "model_verified": True,
-                    "content_types": content_types 
+                    "content_types": content_types
                 }
             }
         )
@@ -194,7 +182,7 @@ async def analyze_image(
             status_code=500,
             content={"status": "error", "message": f"Server error: {str(e)}"}
         )
-    
+
 @router.post("/get-embedding")
 async def get_embedding(request: EmbeddingRequest = Body(...)):
     try:
