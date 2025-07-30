@@ -13,6 +13,7 @@ import os
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from openai_service import router as openai_router
+import numpy as np
 
 app = FastAPI()
 load_dotenv()
@@ -126,65 +127,61 @@ class PriceIn(BaseModel):
     id: int
     price: float
 
-# Nowa funkcja do znajdowania podobnych produktów
-def find_similar_product(product_name: str, product_description: Optional[str], threshold: float = 0.95):
-    """
-    Znajduje podobny produkt w bazie danych na podstawie embeddingów
-    
-    Args:
-        product_name: nazwa produktu
-        product_description: opis produktu (opcjonalny)
-        threshold: próg podobieństwa (domyślnie 95%)
-    
-    Returns:
-        tuple: (product_id, similarity_score) lub (None, 0) jeśli nie znaleziono
-    """
+
+def find_similar_product(
+    product_name: str,
+    product_description: Optional[str] = None,
+    query_embedding: Optional[np.ndarray] = None,
+    threshold: float = 0.95
+):
     try:
-        # Inicjalizuj model do embeddingów
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        
-        # Utworz embedding dla nowego produktu
-        text_to_embed = product_description if product_description else product_name
-        new_embedding = model.encode(text_to_embed, batch_size=384).tolist()
-        
-        # Pobierz wszystkie produkty z embeddingami
+        # Przygotuj embedding jeśli nie został podany
+        if query_embedding is None:
+            model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            text_to_embed = product_description if product_description else product_name
+            query_embedding = model.encode(text_to_embed)
+       
+        query_embedding = np.array(query_embedding).reshape(1, -1)
+
         with engine.connect() as conn:
             stmt = select(products.c.id, products.c.name, products.c.embedding)
             result = conn.execute(stmt)
-            
+
             best_match_id = None
             best_similarity = 0.0
-            
+
             for row in result:
                 existing_embedding = row.embedding
-                
-                # Parsuj embedding jeśli jest w formacie string
+
                 if isinstance(existing_embedding, str):
                     try:
                         existing_embedding = json.loads(existing_embedding)
                     except json.JSONDecodeError:
                         continue
-                
-                if existing_embedding and len(existing_embedding) == len(new_embedding):
-                    # Oblicz podobieństwo cosinusowe
-                    similarity = cosine_similarity(
-                        [new_embedding], 
-                        [existing_embedding]
-                    )[0][0]
-                    
-                    if similarity > best_similarity:
-                        best_similarity = similarity
+
+                if existing_embedding is None:
+                    continue
+
+                existing_embedding = np.array(existing_embedding)
+                if existing_embedding.ndim == 1:
+                    existing_embedding = existing_embedding.reshape(1, -1)
+
+                if existing_embedding.shape == query_embedding.shape:
+                    similarity = cosine_similarity(query_embedding, existing_embedding)[0][0]
+
+                    if float(similarity) > best_similarity:
+                        best_similarity = float(similarity)
                         best_match_id = row.id
-            
-            # Zwróć wynik jeśli podobieństwo przekracza próg
-            if best_similarity >= threshold:
-                return best_match_id, best_similarity
-            else:
-                return None, best_similarity
-                
+
+        if best_similarity >= threshold:
+            return best_match_id, best_similarity
+        else:
+            return None, best_similarity
+
     except Exception as e:
         print(f"Error in find_similar_product: {e}")
         return None, 0.0
+
 
 def create_or_update_product(product_name: str, unit_price: float, product_description: Optional[str] = None):
     """
@@ -243,6 +240,72 @@ def create_or_update_product(product_name: str, unit_price: float, product_descr
             conn.commit()
             return new_product_id
 
+def create_or_update_product_with_id(product_name: str, unit_price: float, product_description: Optional[str] = None):
+    """
+    Tworzy nowy produkt lub aktualizuje istniejący, zwraca JSON:
+    {
+        "id": int,
+        "name": str,
+        "old_price": float | None,
+        "new_price": float
+    }
+    """
+    similar_product_id, similarity = find_similar_product(product_name, product_description)
+
+    with engine.connect() as conn:
+        if similar_product_id and similarity >= 0.95:
+            # Produkt podobny istnieje – pobieramy jego aktualną cenę
+            result = conn.execute(
+                select(prices.c.price).where(prices.c.id == similar_product_id)
+            ).first()
+
+            current_price = float(result.price) if result else 0.0
+            price_changed = current_price != unit_price
+
+            if price_changed:
+                conn.execute(
+                    text("UPDATE prices SET price = :price WHERE id = :id"),
+                    {"price": unit_price, "id": similar_product_id}
+                )
+                conn.commit()
+
+            return {
+                "id": similar_product_id,
+                "name": product_name,
+                "old_price": current_price if price_changed else None,
+                "new_price": unit_price
+            }
+
+        else:
+            # Tworzymy nowy produkt
+            model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            text_to_embed = product_description if product_description else product_name
+            embedding = model.encode(text_to_embed).tolist()
+
+            # Wstawiamy produkt
+            product_result = conn.execute(
+                text("INSERT INTO products (name, embedding, description) VALUES (:name, :embedding, :description) RETURNING id"),
+                {
+                    "name": product_name,
+                    "embedding": embedding,
+                    "description": product_description
+                }
+            )
+            new_product_id = product_result.scalar()
+
+            # Wstawiamy cenę
+            conn.execute(
+                text("INSERT INTO prices (id, price) VALUES (:id, :price)"),
+                {"id": new_product_id, "price": unit_price}
+            )
+            conn.commit()
+
+            return {
+                "id": new_product_id,
+                "name": product_name,
+                "old_price": None,
+                "new_price": unit_price
+            }
 # Funkcja pomocnicza do parsowania daty
 def parse_date_string(date_str: str) -> datetime:
     """Parsuje string daty do obiektu datetime"""
@@ -273,6 +336,48 @@ def parse_date_string(date_str: str) -> datetime:
 @app.get("/")
 def read_root():
     return {"message": "Hello from FastAPI!"}
+@app.post("/products/compare")
+def check_product(product: ProductIn):
+    # Przygotuj embedding
+    if product.embedding:
+        query_embedding = np.array(product.embedding)
+    else:
+        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        text_to_embed = product.description or product.name
+        query_embedding = model.encode(text_to_embed)
+
+    # Szukaj podobnego produktu
+    similar_product_id, similarity = find_similar_product(product.name, product.description, query_embedding)
+    # print(similar_product_id);
+    # print(similarity)
+    if similar_product_id and similarity >= 0.95:
+        with engine.connect() as conn:
+            result = conn.execute(
+                select(products.c.name, prices.c.price).where(prices.c.id == similar_product_id)
+            ).first()
+
+            if result:
+                old_price = float(result.price)
+                price_changed = old_price != product.price
+                return {
+                    "exists": True,
+                    "id": similar_product_id,
+                    "name": result.name,
+                    "old_price": old_price,
+                    "new_price": product.price,
+                    "price_changed": price_changed,
+                    "similarity": similarity
+                }
+
+    return {
+        "exists": False,
+        "id": None,
+        "name": None,
+        "old_price": None,
+        "new_price": product.price,
+        "price_changed": None,
+        "similarity": similarity
+    }
 
 @app.get("/products", response_model=list[SimpleProductResponse])
 def get_products():
