@@ -132,7 +132,7 @@ def find_similar_product(
     product_name: str,
     product_description: Optional[str] = None,
     query_embedding: Optional[np.ndarray] = None,
-    threshold: float = 0.95
+    threshold: float = 0.75
 ):
     try:
         # Przygotuj embedding jeśli nie został podany
@@ -194,7 +194,7 @@ def create_or_update_product(product_name: str, unit_price: float, product_descr
     similar_product_id, similarity = find_similar_product(product_name, product_description)
     
     with engine.connect() as conn:
-        if similar_product_id and similarity >= 0.95:
+        if similar_product_id and similarity >=0.75:
             print(f"Found similar product (ID: {similar_product_id}, similarity: {similarity:.3f}) for '{product_name}'")
             
             # Aktualizuj cenę istniejącego produktu jeśli jest różna
@@ -253,7 +253,7 @@ def create_or_update_product_with_id(product_name: str, unit_price: float, produ
     similar_product_id, similarity = find_similar_product(product_name, product_description)
 
     with engine.connect() as conn:
-        if similar_product_id and similarity >= 0.95:
+        if similar_product_id and similarity >= 0.75:
             # Produkt podobny istnieje – pobieramy jego aktualną cenę
             result = conn.execute(
                 select(prices.c.price).where(prices.c.id == similar_product_id)
@@ -350,7 +350,7 @@ def check_product(product: ProductIn):
     similar_product_id, similarity = find_similar_product(product.name, product.description, query_embedding)
     # print(similar_product_id);
     # print(similarity)
-    if similar_product_id and similarity >= 0.95:
+    if similar_product_id and similarity >=0.75:
         with engine.connect() as conn:
             result = conn.execute(
                 select(products.c.name, prices.c.price).where(prices.c.id == similar_product_id)
