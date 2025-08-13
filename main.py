@@ -375,6 +375,7 @@ def check_product(product: ProductIn):
         "name": None,
         "old_price": None,
         "new_price": product.price,
+
         "price_changed": None,
         "similarity": similarity
     }
@@ -555,8 +556,6 @@ def add_products_bulk(products_data: list[ProductIn]):
         "errors": len([r for r in results if r["status"] == "error"]),
         "results": results
     }
-
-# ZMODYFIKOWANE ENDPOINTY DLA PARAGONÓW
 
 @app.post("/receipt/add", response_model=ReceiptResponse)
 def add_receipt(receipt_data: ReceiptData):
