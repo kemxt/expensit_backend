@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sentence_transformers import SentenceTransformer
 from sqlalchemy.orm import sessionmaker
 import os
+from rapidfuzz import fuzz
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from openai_service import router as openai_router
@@ -306,7 +307,7 @@ def create_or_update_product_with_id(product_name: str, unit_price: float, produ
                 "old_price": None,
                 "new_price": unit_price
             }
-# Funkcja pomocnicza do parsowania daty
+
 def parse_date_string(date_str: str) -> datetime:
     """Parsuje string daty do obiektu datetime"""
     try:
@@ -332,10 +333,34 @@ def parse_date_string(date_str: str) -> datetime:
     except:
         return datetime.now()
 
-# Istniejące endpointy
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI!"}
+def hybrid_similarity(name1, name2, emb1, emb2, alpha=0.5):
+    semantic_score = cosine_similarity([emb1], [emb2])[0][0]
+    fuzzy_score = fuzz.partial_ratio(name1, name2) / 100.0  # lepsze dla krótszych nazw
+    first_token1 = name1.lower().split()[0]
+    first_token2 = name2.lower().split()[0]
+    token_bonus = 0.05 if first_token1 == first_token2 else 0.0
+    return alpha * semantic_score + (1 - alpha) * fuzzy_score + token_bonus
+
+def find_similar_product(name, description, query_embedding):
+    # Pobieramy wszystkich kandydatów z bazy z ich embeddingami
+    with engine.connect() as conn:
+        candidates = conn.execute(
+            select(products.c.id, products.c.name, products.c.embedding)
+        ).all()
+
+    best_id = None
+    best_score = 0.0
+
+    for pid, pname, pemb in candidates:
+        pemb_array = np.array(json.loads(pemb), dtype=float)
+        score = hybrid_similarity(name, pname, query_embedding, pemb_array, alpha=0.7)
+        if score > best_score:
+            best_score = score
+            best_id = pid
+
+    return best_id, best_score
+
+
 @app.post("/products/compare")
 def check_product(product: ProductIn):
     # Przygotuj embedding
@@ -346,14 +371,17 @@ def check_product(product: ProductIn):
         text_to_embed = product.description or product.name
         query_embedding = model.encode(text_to_embed)
 
-    # Szukaj podobnego produktu
-    similar_product_id, similarity = find_similar_product(product.name, product.description, query_embedding)
-    # print(similar_product_id);
-    # print(similarity)
-    if similar_product_id and similarity >=0.75:
+    # Szukaj podobnego produktu z użyciem hybrid_similarity
+    similar_product_id, similarity = find_similar_product(
+        product.name, product.description, query_embedding
+    )
+
+    if similar_product_id and similarity >= 0.75:
         with engine.connect() as conn:
             result = conn.execute(
-                select(products.c.name, prices.c.price).where(prices.c.id == similar_product_id)
+                select(products.c.name, prices.c.price)
+                .select_from(products.join(prices, products.c.id == prices.c.id))
+                .where(prices.c.id == similar_product_id)
             ).first()
 
             if result:
@@ -375,11 +403,92 @@ def check_product(product: ProductIn):
         "name": None,
         "old_price": None,
         "new_price": product.price,
-
         "price_changed": None,
         "similarity": similarity
     }
+@app.post("/products/compare/bulk")
+def check_products_bulk(products_in: List[ProductIn]):
+    results = []
 
+    # 1. Przygotuj model tylko raz
+    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+    # 2. Przygotuj embeddings dla wejściowych produktów
+    texts_to_embed = []
+    for p in products_in:
+        if p.embedding:
+            texts_to_embed.append(None)
+        else:
+            texts_to_embed.append(p.description or p.name)
+
+    bulk_embeddings = []
+    if any(t is not None for t in texts_to_embed):
+        embeddings_computed = model.encode(
+            [t for t in texts_to_embed if t is not None]
+        )
+        embed_index = 0
+        for t in texts_to_embed:
+            if t is None:
+                bulk_embeddings.append(None)
+            else:
+                bulk_embeddings.append(embeddings_computed[embed_index])
+                embed_index += 1
+
+    # 3. Pobierz wszystkich kandydatów z bazy (id, name, embedding)
+    with engine.connect() as conn:
+        candidates = conn.execute(
+            select(products.c.id, products.c.name, products.c.embedding)
+        ).all()
+
+    # 4. Dla każdego produktu wejściowego znajdź najlepsze dopasowanie
+    for idx, p in enumerate(products_in):
+        query_embedding = np.array(p.embedding) if p.embedding else bulk_embeddings[idx]
+
+        best_id = None
+        best_score = 0.0
+
+        for pid, pname, pemb in candidates:
+            pemb_array = np.array(json.loads(pemb), dtype=float)
+            score = hybrid_similarity(p.name, pname, query_embedding, pemb_array, alpha=0.7)
+            if score > best_score:
+                best_score = score
+                best_id = pid
+
+        # 5. Jeśli najlepsze dopasowanie przekracza próg
+        if best_id and best_score >= 0.75:
+            with engine.connect() as conn:
+                result = conn.execute(
+                    select(products.c.name, prices.c.price)
+                    .select_from(products.join(prices, products.c.id == prices.c.id))
+                    .where(prices.c.id == best_id)
+                ).first()
+
+                if result:
+                    old_price = float(result.price)
+                    price_changed = old_price != p.price
+                    results.append({
+                        "exists": True,
+                        "id": best_id,
+                        "name": result.name,
+                        "old_price": old_price,
+                        "new_price": p.price,
+                        "price_changed": price_changed,
+                        "similarity": best_score
+                    })
+                    continue
+
+        # 6. Brak dopasowania
+        results.append({
+            "exists": False,
+            "id": None,
+            "name": None,
+            "old_price": None,
+            "new_price": p.price,
+            "price_changed": None,
+            "similarity": best_score
+        })
+
+    return results
 @app.get("/products", response_model=list[SimpleProductResponse])
 def get_products():
     with engine.connect() as conn:
