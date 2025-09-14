@@ -109,34 +109,15 @@ async def analyze_image(
             "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
             "Content-Type": "application/json; charset=utf-8"
         }
-        print("tu smiga")
+        
         models_response = requests.get(
             "https://api.openai.com/v1/models",
             headers=headers,
             timeout=10
         )
 
-        print("Status code:", models_response.status_code)
-        print("Raw response:", models_response.text[:500])  # Pierwsze 500 znaków
-        print("env gpt prompt")
-        print(os.getenv('GPT_PROMPT'))
+        
         # Sprawdź czy response jest prawidłowy JSON
-        try:
-            json_data = models_response.json()
-            print("JSON parsed successfully")
-            print("Keys in response:", json_data.keys())
-            
-            data = json_data.get('data', [])
-            print("Number of models:", len(data))
-            
-            if data:
-                print("First few models:", [m.get('id', 'no-id') for m in data[:5]])
-            else:
-                print("No models found in data")
-                
-        except Exception as e:
-            print("JSON parsing error:", e)
-            print("Response content:", models_response.text)
 
         # Dopiero teraz sprawdzaj gpt-4o
         if models_response.status_code == 200:
@@ -160,7 +141,7 @@ async def analyze_image(
                     "content": [
                         {
                     "type": "text",
-                    "text": os.getenv('GPT_PROMPT') + "\n\nPlease respond in valid JSON format."
+                   "text": os.getenv('GPT_PROMPT') + "\n\nIMPORTANT: Return ONLY valid JSON without markdown formatting or ```json blocks."
                 },
                         {
                             "type": "image_url",
