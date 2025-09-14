@@ -81,9 +81,9 @@ async def analyze_image(
                 status_code=404,
                 content={"status": "error", "message": "Image not found"}
             )
-
+        
         image_bytes = blob.download_as_bytes()
-
+        
         # Weryfikacja poprawności formatu
         try:
             img = Image.open(io.BytesIO(image_bytes))
@@ -109,35 +109,64 @@ async def analyze_image(
             "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
             "Content-Type": "application/json; charset=utf-8"
         }
-
+        print("tu smiga")
         models_response = requests.get(
             "https://api.openai.com/v1/models",
             headers=headers,
             timeout=10
         )
 
-        if "gpt-4o" not in [m['id'] for m in models_response.json().get('data', [])]:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "GPT-4o not available with this API key"}
-            )
+        print("Status code:", models_response.status_code)
+        print("Raw response:", models_response.text[:500])  # Pierwsze 500 znaków
+        print("env gpt prompt")
+        print(os.getenv('GPT_PROMPT'))
+        # Sprawdź czy response jest prawidłowy JSON
+        try:
+            json_data = models_response.json()
+            print("JSON parsed successfully")
+            print("Keys in response:", json_data.keys())
+            
+            data = json_data.get('data', [])
+            print("Number of models:", len(data))
+            
+            if data:
+                print("First few models:", [m.get('id', 'no-id') for m in data[:5]])
+            else:
+                print("No models found in data")
+                
+        except Exception as e:
+            print("JSON parsing error:", e)
+            print("Response content:", models_response.text)
 
+        # Dopiero teraz sprawdzaj gpt-4o
+        if models_response.status_code == 200:
+            data = models_response.json().get('data', [])
+            if "gpt-4o" not in [m['id'] for m in data]:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": "GPT-4o not available with this API key"}
+                )
+        else:
+            return JSONResponse(
+                status_code=models_response.status_code,
+                content={"status": "error", "message": f"API error: {models_response.text}"}
+            )
+        
         payload = {
             "model": "gpt-4o",
-            "response_format": { "type": "json_object" },
             "messages": [
                 {
                     "role": "user",
                     "content": [
                         {
-                            "type": "text",
-                            "text": os.getenv('GPT_PROMPT')
-                        },
+                    "type": "text",
+                    "text": os.getenv('GPT_PROMPT') + "\n\nPlease respond in valid JSON format."
+                },
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
+                        "url": f"data:image/jpeg;base64,{base64_image}"
+                    }
                         }
                     ]
                 }
