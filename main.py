@@ -130,20 +130,30 @@ class PriceIn(BaseModel):
 
 
 def find_similar_product(
+    
     product_name: str,
     product_description: Optional[str] = None,
     query_embedding: Optional[np.ndarray] = None,
     threshold: float = 0.75
 ):
+    """
+    Sprawdza w bazie, czy istnieje produkt podobny semantycznie na podstawie embeddingu.
+    Zwraca (product_id, similarity) lub (None, 0.0)
+    """
     try:
-        # Przygotuj embedding jeśli nie został podany
-        if query_embedding is None:
-            model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-            text_to_embed = product_description if product_description else product_name
-            query_embedding = model.encode(text_to_embed)
-       
-        query_embedding = np.array(query_embedding).reshape(1, -1)
+        # Tworzymy embedding dla zapytania
+        text_to_embed = product_description if product_description else product_name
+        text_to_embed = text_to_embed.strip() if text_to_embed else None
 
+        if not text_to_embed:
+            print("Warning: empty text for embedding")
+            return None, 0.0
+
+        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        query_embedding = model.encode(text_to_embed)
+        query_embedding = np.array(query_embedding, dtype=float).reshape(1, -1)
+
+        # Pobierz produkty z bazy
         with engine.connect() as conn:
             stmt = select(products.c.id, products.c.name, products.c.embedding)
             result = conn.execute(stmt)
@@ -153,6 +163,8 @@ def find_similar_product(
 
             for row in result:
                 existing_embedding = row.embedding
+                if existing_embedding is None:
+                    continue
 
                 if isinstance(existing_embedding, str):
                     try:
@@ -160,19 +172,21 @@ def find_similar_product(
                     except json.JSONDecodeError:
                         continue
 
-                if existing_embedding is None:
-                    continue
-
-                existing_embedding = np.array(existing_embedding)
+                existing_embedding = np.array(existing_embedding, dtype=float)
                 if existing_embedding.ndim == 1:
                     existing_embedding = existing_embedding.reshape(1, -1)
 
-                if existing_embedding.shape == query_embedding.shape:
-                    similarity = cosine_similarity(query_embedding, existing_embedding)[0][0]
+                if existing_embedding.shape[1] != query_embedding.shape[1]:
+                    continue
 
-                    if float(similarity) > best_similarity:
-                        best_similarity = float(similarity)
-                        best_match_id = row.id
+                similarity = cosine_similarity(query_embedding, existing_embedding)[0][0]
+
+                if np.isnan(similarity):
+                    continue
+
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match_id = row.id
 
         if best_similarity >= threshold:
             return best_match_id, best_similarity
@@ -184,62 +198,56 @@ def find_similar_product(
         return None, 0.0
 
 
-def create_or_update_product(product_name: str, unit_price: float, product_description: Optional[str] = None):
+def create_or_update_product(product_name: str, unit_price: float, product_description: str = None):
     """
     Tworzy nowy produkt lub aktualizuje istniejący na podstawie podobieństwa embeddingów
-    
-    Returns:
-        int: product_id (nowego lub istniejącego produktu)
     """
-    # Sprawdź czy istnieje podobny produkt
-    similar_product_id, similarity = find_similar_product(product_name, product_description)
-    
+    # Sprawdź, czy istnieje podobny produkt
+    similar_product_id, similarity = find_similar_product(
+        product_name,
+        product_description,
+        
+    )
+
     with engine.connect() as conn:
-        if similar_product_id and similarity >=0.75:
+        if similar_product_id:
             print(f"Found similar product (ID: {similar_product_id}, similarity: {similarity:.3f}) for '{product_name}'")
-            
-            # Aktualizuj cenę istniejącego produktu jeśli jest różna
+
+            # Aktualizacja ceny jeśli jest różna
             current_price_result = conn.execute(
                 select(prices.c.price).where(prices.c.id == similar_product_id)
             ).first()
-            
+
             if current_price_result and current_price_result.price != unit_price:
-                # Aktualizuj cenę
                 conn.execute(
                     text("UPDATE prices SET price = :price WHERE id = :id"),
                     {"price": unit_price, "id": similar_product_id}
                 )
                 print(f"Updated price for product ID {similar_product_id}: {current_price_result.price} -> {unit_price}")
-            
+
             conn.commit()
             return similar_product_id
-        else:
-            print(f"Creating new product '{product_name}' (best similarity: {similarity:.3f})")
-            
-            # Utwórz embedding dla nowego produktu
-            model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-            text_to_embed = product_description if product_description else product_name
-            embedding = model.encode(text_to_embed, batch_size=384).tolist()
-            
-            # Dodaj nowy produkt
-            product_result = conn.execute(
-                text("INSERT INTO products (name, embedding, description) VALUES (:name, :embedding, :description) RETURNING id"),
-                {
-                    "name": product_name, 
-                    "embedding": embedding, 
-                    "description": product_description
-                }
-            )
-            new_product_id = product_result.scalar()
-            
-            # Dodaj cenę
-            conn.execute(
-                text("INSERT INTO prices (id, price) VALUES (:id, :price)"),
-                {"id": new_product_id, "price": unit_price}
-            )
-            
-            conn.commit()
-            return new_product_id
+
+        # Tworzenie nowego produktu
+        print(f"Creating new product '{product_name}' (best similarity: {similarity:.3f})")
+        text_to_embed = product_description if product_description else product_name
+        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        embedding = model.encode(text_to_embed).tolist()
+
+        # Dodanie do bazy
+        product_result = conn.execute(
+            text("INSERT INTO products (name, embedding, description) VALUES (:name, :embedding, :description) RETURNING id"),
+            {"name": product_name, "embedding": embedding, "description": product_description}
+        )
+        new_product_id = product_result.scalar()
+
+        conn.execute(
+            text("INSERT INTO prices (id, price) VALUES (:id, :price)"),
+            {"id": new_product_id, "price": unit_price}
+        )
+
+        conn.commit()
+        return new_product_id
 
 def create_or_update_product_with_id(product_name: str, unit_price: float, product_description: Optional[str] = None):
     """
@@ -341,24 +349,24 @@ def hybrid_similarity(name1, name2, emb1, emb2, alpha=0.5):
     token_bonus = 0.05 if first_token1 == first_token2 else 0.0
     return alpha * semantic_score + (1 - alpha) * fuzzy_score + token_bonus
 
-def find_similar_product(name, description, query_embedding):
-    # Pobieramy wszystkich kandydatów z bazy z ich embeddingami
-    with engine.connect() as conn:
-        candidates = conn.execute(
-            select(products.c.id, products.c.name, products.c.embedding)
-        ).all()
+# def find_similar_product(name, description, query_embedding):
+#     # Pobieramy wszystkich kandydatów z bazy z ich embeddingami
+#     with engine.connect() as conn:
+#         candidates = conn.execute(
+#             select(products.c.id, products.c.name, products.c.embedding)
+#         ).all()
 
-    best_id = None
-    best_score = 0.0
+#     best_id = None
+#     best_score = 0.0
 
-    for pid, pname, pemb in candidates:
-        pemb_array = np.array(json.loads(pemb), dtype=float)
-        score = hybrid_similarity(name, pname, query_embedding, pemb_array, alpha=0.7)
-        if score > best_score:
-            best_score = score
-            best_id = pid
+#     for pid, pname, pemb in candidates:
+#         pemb_array = np.array(json.loads(pemb), dtype=float)
+#         score = hybrid_similarity(name, pname, query_embedding, pemb_array, alpha=0.7)
+#         if score > best_score:
+#             best_score = score
+#             best_id = pid
 
-    return best_id, best_score
+#     return best_id, best_score
 
 
 @app.post("/products/compare")
@@ -373,7 +381,7 @@ def check_product(product: ProductIn):
 
     # Szukaj podobnego produktu z użyciem hybrid_similarity
     similar_product_id, similarity = find_similar_product(
-        product.name, product.description, query_embedding
+        product.name, product.description
     )
 
     if similar_product_id and similarity >= 0.75:
