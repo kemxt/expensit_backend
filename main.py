@@ -729,7 +729,7 @@ def add_receipt(receipt_data: ReceiptData):
                 response_products.append(
                     ReceiptProductCreate(
                         product_id=product_id,
-                        quantity=product.total_price/product.quantity,
+                        quantity=product.quantity,
                         unit_price= product.unit_price,
                         total_price=product.total_price,
                         purchase_date=purchase_date,
