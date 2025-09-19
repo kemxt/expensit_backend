@@ -130,73 +130,106 @@ class PriceIn(BaseModel):
 
 
 def find_similar_product(
-    
     product_name: str,
     product_description: Optional[str] = None,
     query_embedding: Optional[np.ndarray] = None,
-    threshold: float = 0.75
+    threshold: float = 0.85
 ):
     """
     Sprawdza w bazie, czy istnieje produkt podobny semantycznie na podstawie embeddingu.
-    Zwraca (product_id, similarity) lub (None, 0.0)
+    Przeszukuje WSZYSTKIE embeddingi i zwraca ten z najwyższym podobieństwem.
+    Zwraca (product_id, similarity, product_name) lub (None, 0.0, None)
     """
     try:
-        # Tworzymy embedding dla zapytania
-        text_to_embed = product_description if product_description else product_name
-        text_to_embed = text_to_embed.strip() if text_to_embed else None
+        # Jeśli nie podano query_embedding, tworzymy go
+        if query_embedding is None:
+            text_to_embed = product_description if product_description else product_name
+            text_to_embed = text_to_embed.strip() if text_to_embed else None
 
-        if not text_to_embed:
-            print("Warning: empty text for embedding")
-            return None, 0.0
+            if not text_to_embed:
+                print("Warning: empty text for embedding")
+                return None, 0.0, None
 
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        query_embedding = model.encode(text_to_embed)
+            model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            query_embedding = model.encode(text_to_embed)
+        
+        # Normalizuj query_embedding
         query_embedding = np.array(query_embedding, dtype=float).reshape(1, -1)
 
-        # Pobierz produkty z bazy
+        # Pobierz wszystkie produkty z embeddingami z bazy
         with engine.connect() as conn:
-            stmt = select(products.c.id, products.c.name, products.c.embedding)
+            stmt = select(products.c.id, products.c.name, products.c.embedding).where(
+                products.c.embedding.isnot(None)  # Filtruj tylko produkty z embeddingami
+            )
             result = conn.execute(stmt)
 
             best_match_id = None
             best_similarity = 0.0
+            best_match_name = None
+            processed_count = 0
+            skipped_count = 0
 
             for row in result:
-                existing_embedding = row.embedding
-                if existing_embedding is None:
-                    continue
+                try:
+                    existing_embedding = row.embedding
+                    
+                    # Konwertuj embedding z JSON jeśli trzeba
+                    if isinstance(existing_embedding, str):
+                        try:
+                            existing_embedding = json.loads(existing_embedding)
+                        except json.JSONDecodeError:
+                            skipped_count += 1
+                            continue
 
-                if isinstance(existing_embedding, str):
-                    try:
-                        existing_embedding = json.loads(existing_embedding)
-                    except json.JSONDecodeError:
+                    # Normalizuj existing_embedding
+                    existing_embedding = np.array(existing_embedding, dtype=float)
+                    if existing_embedding.ndim == 1:
+                        existing_embedding = existing_embedding.reshape(1, -1)
+
+                    # Sprawdź kompatybilność wymiarów
+                    if existing_embedding.shape[1] != query_embedding.shape[1]:
+                        skipped_count += 1
                         continue
 
-                existing_embedding = np.array(existing_embedding, dtype=float)
-                if existing_embedding.ndim == 1:
-                    existing_embedding = existing_embedding.reshape(1, -1)
+                    # Oblicz podobieństwo cosinusowe
+                    similarity = cosine_similarity(query_embedding, existing_embedding)[0][0]
 
-                if existing_embedding.shape[1] != query_embedding.shape[1]:
+                    # Sprawdź czy similarity jest prawidłowa
+                    if np.isnan(similarity) or np.isinf(similarity):
+                        skipped_count += 1
+                        continue
+
+                    processed_count += 1
+
+                    # Aktualizuj najlepsze dopasowanie
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_match_id = row.id
+                        best_match_name = row.name
+
+                except Exception as row_error:
+                    print(f"Error processing row {row.id}: {row_error}")
+                    skipped_count += 1
                     continue
 
-                similarity = cosine_similarity(query_embedding, existing_embedding)[0][0]
+            # Logowanie wyników
+            print(f"Processed {processed_count} embeddings, skipped {skipped_count}")
+            print(f"Best similarity: {best_similarity:.4f}")
+            
+            if best_match_id:
+                print(f"Best match: {best_match_name} (ID: {best_match_id})")
 
-                if np.isnan(similarity):
-                    continue
-
-                if similarity > best_similarity:
-                    best_similarity = similarity
-                    best_match_id = row.id
-
-        if best_similarity >= threshold:
-            return best_match_id, best_similarity
-        else:
-            return None, best_similarity
+            # Zwróć wynik na podstawie progu
+            if best_similarity >= threshold:
+                return best_match_id, best_similarity, best_match_name
+            else:
+                return None, best_similarity, None
 
     except Exception as e:
         print(f"Error in find_similar_product: {e}")
-        return None, 0.0
-
+        import traceback
+        traceback.print_exc()
+        return None, 0.0, None
 
 def create_or_update_product(product_name: str, unit_price: float, product_description: str = None):
     """
@@ -206,7 +239,6 @@ def create_or_update_product(product_name: str, unit_price: float, product_descr
     similar_product_id, similarity = find_similar_product(
         product_name,
         product_description,
-        
     )
 
     with engine.connect() as conn:
@@ -723,7 +755,7 @@ def add_receipt(receipt_data: ReceiptData):
                         "product_id": product_id,
                         "product_name": product.product_name,
                         "quantity": product.quantity,
-                        "unit_price": product.unit_price,
+                        "unit_price": product.total_price/product.quantity,
                         "total_price": product.total_price
                     }
                 )
@@ -731,7 +763,7 @@ def add_receipt(receipt_data: ReceiptData):
                 response_products.append(
                     ReceiptProductCreate(
                         product_id=product_id,
-                        quantity=product.quantity,
+                        quantity=product.total_price/product.quantity,
                         unit_price=product.unit_price,
                         total_price=product.total_price,
                         purchase_date=purchase_date,
