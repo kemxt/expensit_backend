@@ -153,8 +153,7 @@ async def analyze_image(
                 }
             ]
         }
-        print("GPT PROMPT")
-        print(os.getenv('GPT_PROMPT'))
+        
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,

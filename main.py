@@ -130,6 +130,7 @@ class PriceIn(BaseModel):
 
 
 def find_similar_product(
+    
     product_name: str,
     product_description: Optional[str] = None,
     query_embedding: Optional[np.ndarray] = None,
@@ -137,100 +138,65 @@ def find_similar_product(
 ):
     """
     Sprawdza w bazie, czy istnieje produkt podobny semantycznie na podstawie embeddingu.
-    Przeszukuje WSZYSTKIE embeddingi i zwraca ten z najwyższym podobieństwem.
-    Zwraca (product_id, similarity, product_name) lub (None, 0.0, None)
+    Zwraca (product_id, similarity) lub (None, 0.0)
     """
     try:
-        # Jeśli nie podano query_embedding, tworzymy go
-        if query_embedding is None:
-            text_to_embed = product_description if product_description else product_name
-            text_to_embed = text_to_embed.strip() if text_to_embed else None
+        # Tworzymy embedding dla zapytania
+        text_to_embed = product_description if product_description else product_name
+        text_to_embed = text_to_embed.strip() if text_to_embed else None
 
-            if not text_to_embed:
-                print("Warning: empty text for embedding")
-                return None, 0.0, None
+        if not text_to_embed:
+            print("Warning: empty text for embedding")
+            return None, 0.0
 
-            model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-            query_embedding = model.encode(text_to_embed)
-        
-        # Normalizuj query_embedding
+        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        query_embedding = model.encode(text_to_embed)
         query_embedding = np.array(query_embedding, dtype=float).reshape(1, -1)
 
-        # Pobierz wszystkie produkty z embeddingami z bazy
+        # Pobierz produkty z bazy
         with engine.connect() as conn:
-            stmt = select(products.c.id, products.c.name, products.c.embedding).where(
-                products.c.embedding.isnot(None)  # Filtruj tylko produkty z embeddingami
-            )
+            stmt = select(products.c.id, products.c.name, products.c.embedding)
             result = conn.execute(stmt)
 
             best_match_id = None
             best_similarity = 0.0
-            best_match_name = None
-            processed_count = 0
-            skipped_count = 0
 
             for row in result:
-                try:
-                    existing_embedding = row.embedding
-                    
-                    # Konwertuj embedding z JSON jeśli trzeba
-                    if isinstance(existing_embedding, str):
-                        try:
-                            existing_embedding = json.loads(existing_embedding)
-                        except json.JSONDecodeError:
-                            skipped_count += 1
-                            continue
-
-                    # Normalizuj existing_embedding
-                    existing_embedding = np.array(existing_embedding, dtype=float)
-                    if existing_embedding.ndim == 1:
-                        existing_embedding = existing_embedding.reshape(1, -1)
-
-                    # Sprawdź kompatybilność wymiarów
-                    if existing_embedding.shape[1] != query_embedding.shape[1]:
-                        skipped_count += 1
-                        continue
-
-                    # Oblicz podobieństwo cosinusowe
-                    similarity = cosine_similarity(query_embedding, existing_embedding)[0][0]
-
-                    # Sprawdź czy similarity jest prawidłowa
-                    if np.isnan(similarity) or np.isinf(similarity):
-                        skipped_count += 1
-                        continue
-
-                    processed_count += 1
-
-                    # Aktualizuj najlepsze dopasowanie
-                    if similarity > best_similarity:
-                        best_similarity = similarity
-                        best_match_id = row.id
-                        best_match_name = row.name
-
-                except Exception as row_error:
-                    print(f"Error processing row {row.id}: {row_error}")
-                    skipped_count += 1
+                existing_embedding = row.embedding
+                if existing_embedding is None:
                     continue
 
-            # Logowanie wyników
-            print(f"Processed {processed_count} embeddings, skipped {skipped_count}")
-            print(f"Best similarity: {best_similarity:.4f}")
-            
-            if best_match_id:
-                print(f"Best match: {best_match_name} (ID: {best_match_id})")
+                if isinstance(existing_embedding, str):
+                    try:
+                        existing_embedding = json.loads(existing_embedding)
+                    except json.JSONDecodeError:
+                        continue
 
-            # Zwróć wynik na podstawie progu
-            if best_similarity >= threshold:
-                return best_match_id, best_similarity, best_match_name
-            else:
-                return None, best_similarity, None
+                existing_embedding = np.array(existing_embedding, dtype=float)
+                if existing_embedding.ndim == 1:
+                    existing_embedding = existing_embedding.reshape(1, -1)
+
+                if existing_embedding.shape[1] != query_embedding.shape[1]:
+                    continue
+
+                similarity = cosine_similarity(query_embedding, existing_embedding)[0][0]
+
+                if np.isnan(similarity):
+                    continue
+
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match_id = row.id
+
+        if best_similarity >= threshold:
+            return best_match_id, best_similarity
+        else:
+            return None, best_similarity
 
     except Exception as e:
         print(f"Error in find_similar_product: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, 0.0, None
-
+        return None, 0.0
+    
 def create_or_update_product(product_name: str, unit_price: float, product_description: str = None):
     """
     Tworzy nowy produkt lub aktualizuje istniejący na podstawie podobieństwa embeddingów
