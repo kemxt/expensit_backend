@@ -134,7 +134,7 @@ def find_similar_product(
     product_name: str,
     product_description: Optional[str] = None,
     query_embedding: Optional[np.ndarray] = None,
-    threshold: float = 0.85
+    threshold: float = 0.80
 ):
     """
     Sprawdza w bazie, czy istnieje produkt podobny semantycznie na podstawie embeddingu.
@@ -701,8 +701,8 @@ def add_receipt(receipt_data: ReceiptData):
             # Przetwórz każdy produkt z paragonu
             response_products = []
             for product in receipt_data.products:
-                print("produkt:")
-                print(product.product_name)
+                print("produkt total:")
+                print(product.total_price)
                 product_id = create_or_update_product(
                     product_name=product.product_name,
                     unit_price=product.unit_price,
