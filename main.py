@@ -708,8 +708,8 @@ def add_receipt(receipt_data: ReceiptData):
                     unit_price=product.unit_price,
                     product_description=None  
                 )
-                
-                # Dodaj produkt do receipt_products z product_id
+                unit = product.total_price / product.quantity
+                print("Produkt {product_name} - unit price to {unit} a total to {total_price} a quantity to {quantity}")
                 conn.execute(
                     text("""
                         INSERT INTO receipt_products 
@@ -721,7 +721,7 @@ def add_receipt(receipt_data: ReceiptData):
                         "product_id": product_id,
                         "product_name": product.product_name,
                         "quantity": product.quantity,
-                        "unit_price": product.total_price/product.quantity,
+                        "unit_price": product.total_price / product.quantity if product.quantity > 0 else 0,
                         "total_price": product.total_price
                     }
                 )
@@ -730,7 +730,7 @@ def add_receipt(receipt_data: ReceiptData):
                     ReceiptProductCreate(
                         product_id=product_id,
                         quantity=product.total_price/product.quantity,
-                        unit_price=product.unit_price,
+                        unit_price= product.total_price / product.quantity if product.quantity > 0 else 0,
                         total_price=product.total_price,
                         purchase_date=purchase_date,
                         product_name=product.product_name
