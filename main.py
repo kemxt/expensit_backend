@@ -65,7 +65,7 @@ class ProductIn(BaseModel):
 # Modele Pydantic
 class ReceiptProductCreate(BaseModel):
     product_id: Optional[int] = None  # Dodane pole
-    quantity: int
+    quantity: float
     unit_price: float
     total_price: float
     purchase_date: Optional[datetime] = None
