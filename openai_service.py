@@ -64,8 +64,9 @@ def analyze_image(
         openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) 
         user_id = user_token["uid"]
         image_path = image_data["image_path"].strip().lstrip('/')
+        products = image_data.get("products", [])
+
         
-        # Weryfikacja dostępu
         if not image_path.startswith(f"users/{user_id}/"):
             return JSONResponse(status_code=403, content={"error": "Access denied"})
 
@@ -106,7 +107,7 @@ def analyze_image(
         receipt_json = json.loads(analysis_response.choices[0].message.content)
         
        
-        agent_id = get_or_create_assistant(user_id)
+        agent_id = get_or_create_assistant(user_id,products)
         thread_id = get_or_create_thread(user_id, agent_id)
         print(agent_id)
         print(thread_id)
