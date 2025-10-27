@@ -91,7 +91,7 @@ def analyze_image(
                     "content": [
                         {
                             "type": "text",
-                            "text": "Analyze this receipt and return JSON with: shop, date, total, items[]"
+                            "text": "Analyze this receipt and return JSON"
                         },
                         {
                             "type": "image_url",
