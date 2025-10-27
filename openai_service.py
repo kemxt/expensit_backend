@@ -142,12 +142,9 @@ async def chat(
         print("Start")
         openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         user_id = user_token["uid"]
-        messages = request.get("messages", [])
+        user_message = request.get("message", "").strip()
         products = request.get("products", {})
-        user_message = next(
-            (msg["content"] for msg in reversed(messages) if msg["role"] == "user"),
-            None
-        )
+        
         if not user_message:
             return JSONResponse(
                 status_code=400,
@@ -161,7 +158,7 @@ async def chat(
         print(f"User: {user_id}")
         print(f"Agent: {agent_id}")
         print(f"Thread: {thread_id}")
-        print(f"Message: {messages}")
+        print(f"Message: {user_message}")
         
         # Dodaj wiadomość użytkownika do thread'a
         openai_client.beta.threads.messages.create(
@@ -169,9 +166,10 @@ async def chat(
             role="user",
             content=user_message
         )
-        
+       
         # Generator do streamowania odpowiedzi
         async def generate():
+            message = ''
             try:
                 with openai_client.beta.threads.runs.stream(
                     thread_id=thread_id,
@@ -183,11 +181,12 @@ async def chat(
                             for content in event.data.delta.content:
                                 if hasattr(content, 'text') and hasattr(content.text, 'value'):
                                     yield f"data: {json.dumps({'type': 'content', 'text': content.text.value})}\n\n"
-                        
+                                    
+                                    message += content.text.value
                         # Wyślij status zakończenia
                         elif event.event == "thread.run.completed":
                             yield f"data: {json.dumps({'type': 'done', 'thread_id': thread_id})}\n\n"
-                        
+                            print(message)
                         # Obsłuż błędy
                         elif event.event == "thread.run.failed":
                             yield f"data: {json.dumps({'type': 'error', 'message': 'Run failed'})}\n\n"

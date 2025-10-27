@@ -16,24 +16,18 @@ PROMPT_PATH = Path("prompt.txt")
 
 
 def get_or_create_assistant(firebase_uid: str,products) -> str:
-    
     db = getDb()
-    
     user_doc = db.collection("users_assistants").document(firebase_uid).get()
     if user_doc.exists and "assistant_id" in user_doc.to_dict():
         return user_doc.to_dict()["assistant_id"]
-    
-    
    
-    
     with open(PROMPT_PATH, "r", encoding="utf-8") as f:
         system_instructions = f.read()
 
     assistant = client.beta.assistants.create(
         name=f"Financial Assistant for {firebase_uid}",
         instructions=f"""
-Jesteś osobistym asystentem finansowym użytkownika. Twoim jedynym zadaniem jest analizowanie historii wydatków, paragonów oraz wspieranie użytkownika w zarządzaniu finansami.
-
+Jesteś osobistym asystentem finansowym użytkownika. Twoim jedynym zadaniem jest analizowanie historii wydatków, paragonów oraz wspieranie użytkownika w zarządzaniu finansami. 
 DOSTĘPNE INFORMACJE: 
 - Lista wszystkich paragonów użytkownika i produktów w nich zawartych:
 {products}
@@ -45,7 +39,7 @@ ZASADY:
 4. Dzisiejsza data to: {datetime.now()}
 5. Przywitaj się z użytkownikiem i zaproponuj mu co może dzisiaj zbadać.
 """,
-        model="gpt-4o"
+        
     )
     
     
