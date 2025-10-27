@@ -15,7 +15,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 PROMPT_PATH = Path("prompt.txt")
 
 
-def get_or_create_assistant(firebase_uid: str) -> str:
+def get_or_create_assistant(firebase_uid: str,products) -> str:
     
     db = getDb()
     
@@ -24,28 +24,28 @@ def get_or_create_assistant(firebase_uid: str) -> str:
         return user_doc.to_dict()["assistant_id"]
     
     
-    file = client.files.create(
-        file=open(PROMPT_PATH, "rb"), 
-        purpose="assistants"
-    )
+   
     
     with open(PROMPT_PATH, "r", encoding="utf-8") as f:
         system_instructions = f.read()
 
     assistant = client.beta.assistants.create(
-        name=f"ReceiptAnalyzer_{firebase_uid}",
-        instructions=system_instructions,
-        model="gpt-4o",
-        tools=[{"type": "file_search"}],
-        tool_resources={
-            "file_search": {
-                "vector_stores": [
-                    {
-                        "file_ids": [file.id]
-                    }
-                ]
-            }
-        }
+        name=f"Financial Assistant for {firebase_uid}",
+        instructions=f"""
+Jesteś osobistym asystentem finansowym użytkownika. Twoim jedynym zadaniem jest analizowanie historii wydatków, paragonów oraz wspieranie użytkownika w zarządzaniu finansami.
+
+DOSTĘPNE INFORMACJE: 
+- Lista wszystkich paragonów użytkownika i produktów w nich zawartych:
+{products}
+
+ZASADY:
+1. Ignoruj lub uprzejmie odmów odpowiedzi na pytania niezwiązane z tematyką finansów...
+2. Nie udzielaj odpowiedzi z zakresu matematyki, historii...
+3. Skupiaj się wyłącznie na analizie wydatków...
+4. Dzisiejsza data to: {datetime.now()}
+5. Przywitaj się z użytkownikiem i zaproponuj mu co może dzisiaj zbadać.
+""",
+        model="gpt-4o"
     )
     
     

@@ -142,8 +142,12 @@ async def chat(
         print("Start")
         openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         user_id = user_token["uid"]
-        user_message = request.get("message", "").strip()
-        
+        messages = request.get("messages", [])
+        products = request.get("products", {})
+        user_message = next(
+            (msg["content"] for msg in reversed(messages) if msg["role"] == "user"),
+            None
+        )
         if not user_message:
             return JSONResponse(
                 status_code=400,
@@ -151,13 +155,13 @@ async def chat(
             )
         
         # Pobierz asystenta i thread
-        agent_id = get_or_create_assistant(user_id)
+        agent_id = get_or_create_assistant(user_id,products)
         thread_id = get_or_create_thread(user_id, agent_id)
         
         print(f"User: {user_id}")
         print(f"Agent: {agent_id}")
         print(f"Thread: {thread_id}")
-        print(f"Message: {user_message}")
+        print(f"Message: {messages}")
         
         # Dodaj wiadomość użytkownika do thread'a
         openai_client.beta.threads.messages.create(
