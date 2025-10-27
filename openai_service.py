@@ -1,13 +1,16 @@
+import asyncio
 import base64
 import datetime
 from io import BytesIO
 import io
 import os
 import tempfile
+import time
 from PIL import Image
 from fastapi import Body, FastAPI, HTTPException, APIRouter, requests
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
+from openai import AsyncOpenAI, OpenAI
 import requests
 import json
 from dotenv import load_dotenv
@@ -17,6 +20,7 @@ import firebase_admin
 from firebase_admin import credentials, storage, auth
 from fastapi import Body, FastAPI, HTTPException, Depends, Header
 from typing import Dict, Optional
+from users import get_or_create_assistant, get_or_create_thread
 
 router = APIRouter()
 
@@ -51,218 +55,199 @@ async def verify_firebase_token(authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
 
-
-import asyncio
-import aiohttp
-from fastapi import BackgroundTasks
-
-# Cache dla sprawdzenia modelu (opcjonalne)
-MODEL_CHECK_CACHE = {"checked": False, "timestamp": 0}
-MODEL_CHECK_TTL = 3600  # 1 godzina
-
 @router.post("/analyze-image")
-async def analyze_image(
-    image_data: Dict[str, str] = Body(...),
+def analyze_image(
+    image_data: dict = Body(...),
     user_token: dict = Depends(verify_firebase_token)
 ):
     try:
+        openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) 
         user_id = user_token["uid"]
         image_path = image_data["image_path"].strip().lstrip('/')
-
-        # Szybkie walidacje na początku
-        if not image_path.lower().endswith(('.jpg', '.jpeg')):
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "Only JPG/JPEG images are supported"}
-            )
-
+        
+        # Weryfikacja dostępu
         if not image_path.startswith(f"users/{user_id}/"):
-            return JSONResponse(
-                status_code=403,
-                content={"status": "error", "message": "Access denied"}
-            )
+            return JSONResponse(status_code=403, content={"error": "Access denied"})
 
+        # Pobranie signed URL
         bucket = storage.bucket('expensit-10546.appspot.com')
         blob = bucket.blob(image_path)
-
+        
         if not blob.exists():
-            return JSONResponse(
-                status_code=404,
-                content={"status": "error", "message": "Image not found"}
-            )
+            return JSONResponse(status_code=404, content={"error": "Image not found"})
         
-        # Pobierz obraz
-        image_bytes = blob.download_as_bytes()
-        
-        # USUNIĘTE: Niepotrzebne otwieranie obrazu przez PIL
-        # To sprawdzenie jest redundantne - jeśli OpenAI nie może odczytać, zwróci błąd
-        
-        # Sprawdź rozmiar PRZED kodowaniem base64
-        image_size_mb = len(image_bytes) / (1024 * 1024)
-        if image_size_mb > 20:
-            return JSONResponse(
-                status_code=400,
-                content={"status": "error", "message": "Image too large (max 20MB)"}
-            )
+        signed_url = blob.generate_signed_url(expiration=datetime.timedelta(minutes=15))
 
-        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-
-        # USUNIĘTE: Sprawdzanie dostępności modelu przy każdym requescie
-        # To jest ogromna strata czasu - GPT-4o jest stabilny i dostępny
-        # Jeśli chcesz, możesz to sprawdzać raz na godzinę w tle
-        
-        headers = {
-            "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
-            "Content-Type": "application/json; charset=utf-8"
-        }
-        
-        payload = {
-            "model": "gpt-4o",
-            "messages": [
+        analysis_response = openai_client.chat.completions.create(
+            model="gpt-4o",  
+            messages=[
+                {
+                    "role": "system",
+                    "content": os.getenv("GPT_PROMPT")  
+                },
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "text",
-                            "text": os.getenv('GPT_PROMPT') + "\n\nIMPORTANT: Return ONLY valid JSON without markdown formatting or ```json blocks."
+                            "text": "Analyze this receipt and return JSON with: shop, date, total, items[]"
                         },
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
+                            "image_url": {"url": signed_url}
                         }
                     ]
                 }
             ],
-            "max_tokens": 1000  # Dodaj limit tokenów dla szybszej odpowiedzi
+            response_format={"type": "json_object"}  # Wymusza JSON
+        )
+        
+        
+        receipt_json = json.loads(analysis_response.choices[0].message.content)
+        
+       
+        agent_id = get_or_create_assistant(user_id)
+        thread_id = get_or_create_thread(user_id, agent_id)
+        print(agent_id)
+        print(thread_id)
+        # Dodaj do thread'a tylko tekst z JSONem
+        openai_client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=f"Receipt analyzed:\n```json\n{json.dumps(receipt_json, indent=2)}\n```"
+        )
+        
+        # Opcjonalnie: Dodaj odpowiedź asystenta żeby zatwierdzić
+        openai_client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="assistant",
+            content=f"Receipt saved: {receipt_json.get('shop', 'Unknown')} - {receipt_json.get('total', 0)} PLN"
+        )
+        
+        return {
+            "status": "success",
+            "analysis": receipt_json,
+            "message": "Receipt analyzed and added to conversation history"
         }
         
-        # Użyj aiohttp zamiast requests (asynchroniczny)
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=60)
-            ) as response:
-                
-                if response.status != 200:
-                    error_text = await response.text()
-                    return JSONResponse(
-                        status_code=response.status,
-                        content={
-                            "status": "error",
-                            "message": "OpenAI API request failed",
-                            "details": error_text
-                        }
-                    )
-                
-                result = await response.json()
-                
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "status": "success",
-                        "analysis": result['choices'][0]['message']['content']
-                    }
-                )
-
-    except asyncio.TimeoutError:
-        return JSONResponse(
-            status_code=504,
-            content={"status": "error", "message": "Request timeout"}
-        )
-    except aiohttp.ClientError as e:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Network error: {str(e)}"}
-        )
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Server error: {str(e)}"}
-        )
+        return JSONResponse(status_code=500, content={"error": str(e)})
     
-@router.post("/get-embedding")
-async def get_embedding(request: EmbeddingRequest = Body(...)):
+@router.post("/chat")
+async def chat(
+    request: dict = Body(...),
+    user_token: dict = Depends(verify_firebase_token)
+):
     try:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+        print("Start")
+        openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        user_id = user_token["uid"]
+        user_message = request.get("message", "").strip()
         
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.openai.com/v1/embeddings",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={"input": request.text, "model": "text-embedding-ada-002"}
+        if not user_message:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Message cannot be empty"}
             )
-            return response.json()
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=e.response.status_code, detail=str(e))
-
-@router.post("/stream-analyze-image")
-async def stream_analyze_image_with_openai(image_request: ImageAnalysisRequest):
-    """Stream the analysis of an image using OpenAI's GPT-4o model."""
-    try:
-        api_key = os.getenv('OPENAI_API_KEY')
-        prompt = os.getenv('GPT_PROMPT')
         
-        if not api_key or not prompt:
-            raise HTTPException(status_code=500, detail="API configuration missing")
+        # Pobierz asystenta i thread
+        agent_id = get_or_create_assistant(user_id)
+        thread_id = get_or_create_thread(user_id, agent_id)
         
-        image_url = str(image_request.image_url)
+        print(f"User: {user_id}")
+        print(f"Agent: {agent_id}")
+        print(f"Thread: {thread_id}")
+        print(f"Message: {user_message}")
         
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
+        # Dodaj wiadomość użytkownika do thread'a
+        openai_client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=user_message
+        )
         
-        payload = {
-            "model": "gpt-4o",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_url}
-                        }
-                    ]
-                }
-            ],
-            "stream": True
-        }
-        
+        # Generator do streamowania odpowiedzi
         async def generate():
-            async with httpx.AsyncClient() as client:
-                async with client.stream("POST", url, headers=headers, json=payload) as response:
-                    if response.status_code != 200:
-                        yield f"data: {json.dumps({'error': f'OpenAI API error: {response.text}'})}\n\n"
-                        return
-                    
-                    async for chunk in response.aiter_lines():
-                        if chunk.startswith('data: '):
-                            json_str = chunk[6:].strip()
-                            if json_str == "[DONE]":
-                                break
+            try:
+                with openai_client.beta.threads.runs.stream(
+                    thread_id=thread_id,
+                    assistant_id=agent_id,
+                ) as stream:
+                    for event in stream:
+                        # Streamuj fragmenty tekstu
+                        if event.event == "thread.message.delta":
+                            for content in event.data.delta.content:
+                                if hasattr(content, 'text') and hasattr(content.text, 'value'):
+                                    yield f"data: {json.dumps({'type': 'content', 'text': content.text.value})}\n\n"
+                        
+                        # Wyślij status zakończenia
+                        elif event.event == "thread.run.completed":
+                            yield f"data: {json.dumps({'type': 'done', 'thread_id': thread_id})}\n\n"
+                        
+                        # Obsłuż błędy
+                        elif event.event == "thread.run.failed":
+                            yield f"data: {json.dumps({'type': 'error', 'message': 'Run failed'})}\n\n"
                             
-                            try:
-                                data = json.loads(json_str)
-                                content = data.get('choices', [{}])[0].get('delta', {}).get('content', '')
-                                yield f"data: {json.dumps({'content': content})}\n\n"
-                            except json.JSONDecodeError:
-                                continue
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
         
-        return StreamingResponse(generate(), media_type="text/event-stream")
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+            
+    except Exception as e:
+        import traceback
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+        )
+
+@router.delete("/chat/clear")
+def clear_chat_history(user_token: dict = Depends(verify_firebase_token)):
+    try:
+        openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        user_id = user_token["uid"]
+        
+        # Pobierz obecny thread_id
+        agent_id = get_or_create_assistant(user_id)
+        old_thread_id = get_or_create_thread(user_id, agent_id)
+        
+        # Usuń stary thread
+        try:
+            openai_client.beta.threads.delete(old_thread_id)
+            print(f"Deleted thread: {old_thread_id}")
+        except Exception as e:
+            print(f"Error deleting thread: {e}")
+        
+        # Stwórz nowy thread
+        new_thread = openai_client.beta.threads.create()
+        
+    
+        return {
+            "status": "success",
+            "message": "Chat history cleared",
+            "old_thread_id": old_thread_id,
+            "new_thread_id": new_thread.id
+        }
         
     except Exception as e:
-        async def generate_error():
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-        return StreamingResponse(generate_error(), media_type="text/event-stream")
-
+        import traceback
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+        )
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
