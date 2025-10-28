@@ -1,5 +1,8 @@
-import datetime
+import asyncio
+
 import os
+from pathlib import Path
+import time
 from fastapi import Body, FastAPI, HTTPException, APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import OpenAI
@@ -11,6 +14,8 @@ from firebase_admin import credentials, storage, auth
 from fastapi import Body, FastAPI, HTTPException, Depends, Header
 from typing import Optional
 from users import get_or_create_assistant, get_or_create_thread
+from google.cloud import vision
+
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "config/expensit-10546-firebase-adminsdk-q25nr-1769d00b3c.json"
 
 
@@ -46,88 +51,128 @@ async def verify_firebase_token(authorization: Optional[str] = Header(None)):
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
 
+def load_receipt_prompt():
+    """Wczytuje prompt z pliku tekstowego."""
+    prompt_file = Path(__file__).parent / "prompt.txt"
+    
+    if prompt_file.exists():
+        prompt = prompt_file.read_text(encoding='utf-8')
+        print(f"✅ Loaded prompt from file: {len(prompt)} characters")
+        return prompt
+    else:
+        print(f"⚠️  Prompt file not found: {prompt_file}")
+        
+        return os.getenv("GPT_PROMPT", "Extract receipt data to JSON.")
 
 @router.post("/analyze-image")
-def analyze_image(
+async def analyze_image(
     image_data: dict = Body(...),
     user_token: dict = Depends(verify_firebase_token)
 ):
+    start_time = time.time()
+    
     try:
-        openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) 
+        openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         user_id = user_token["uid"]
         image_path = image_data["image_path"].strip().lstrip('/')
-        products = image_data.get("products", [])
 
-        
         if not image_path.startswith(f"users/{user_id}/"):
             return JSONResponse(status_code=403, content={"error": "Access denied"})
 
-        # Pobranie signed URL
         bucket = storage.bucket('expensit-10546.appspot.com')
         blob = bucket.blob(image_path)
         
         if not blob.exists():
             return JSONResponse(status_code=404, content={"error": "Image not found"})
         
-        signed_url = blob.generate_signed_url(expiration=datetime.timedelta(minutes=15))
+       
+        print(f"⏱️ Running Vision OCR...")
+        ocr_start = time.time()
+        
+        vision_client = vision.ImageAnnotatorClient()
+        image_bytes = await asyncio.to_thread(blob.download_as_bytes)
+        image = vision.Image(content=image_bytes)
+        
+        response = await asyncio.to_thread(
+            vision_client.document_text_detection,  # Lepsze dla paragonów niż text_detection
+            image=image
+        )
+        
+        if not response.full_text_annotation:
+            return JSONResponse(status_code=400, content={"error": "No text found"})
+        
+        raw_text = response.full_text_annotation.text
+        
+        print(f"✅ OCR done in {time.time() - ocr_start:.2f}s ({len(raw_text)} chars)")
+        
+        # KROK 2: GPT-4o strukturyzuje tekst (~3-5s, szybsze niż analiza obrazu)
+        print(f"⏱️ Structuring with GPT-4o...")
+        gpt_start = time.time()
+        system_prompt = load_receipt_prompt()
+        print(f"⏱️  Structuring with GPT-4o (prompt: {len(system_prompt)} chars)...")
 
-        analysis_response = openai_client.chat.completions.create(
-            model="gpt-4o",  
+        structure_response = await asyncio.to_thread(
+            openai_client.chat.completions.create,
+            model="gpt-4o",
             messages=[
                 {
                     "role": "system",
-                    "content": os.getenv("GPT_PROMPT")  
+                    "content": system_prompt
                 },
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Analyze this receipt and return JSON, Do NOT include any explanations. Only return JSON with keys in double quotes.",
-                                     
-                                     
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": signed_url}
-                        }
-                    ]
+                    "content": f"""Structure this receipt OCR text into JSON. 
+Extract ALL items with exact prices (including decimal places).
+
+OCR TEXT:
+{raw_text}
+
+Return structured JSON."""
                 }
             ],
-            response_format={"type": "json_object"}  # Wymusza JSON
+            response_format={"type": "json_object"},
+            temperature=0,
+            max_tokens=1500
         )
         
+        print(f"✅ Structured in {time.time() - gpt_start:.2f}s")
         
-        receipt_json = json.loads(analysis_response.choices[0].message.content)
+        receipt_json = json.loads(structure_response.choices[0].message.content)
         
-       
-        agent_id = get_or_create_assistant(user_id,products)
-        thread_id = get_or_create_thread(user_id, agent_id)
-        print(agent_id)
-        print(thread_id)
-        # Dodaj do thread'a tylko tekst z JSONem
-        openai_client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=f"Receipt analyzed:\n```json\n{json.dumps(receipt_json, indent=2)}\n```"
-        )
+        # Zapis w tle
+        receipt_message = f"Receipt: {receipt_json.get('shop', 'Unknown')} - {receipt_json.get('total', 0)} {receipt_json.get('currency', 'PLN')}"
+        asyncio.create_task(save_receipt_to_history(user_id, receipt_json, receipt_message))
         
-        # Opcjonalnie: Dodaj odpowiedź asystenta żeby zatwierdzić
-        openai_client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="assistant",
-            content=f"Receipt saved: {receipt_json.get('shop', 'Unknown')} - {receipt_json.get('total', 0)} PLN"
-        )
+        elapsed = time.time() - start_time
+        print(f"🎉 Total time: {elapsed:.2f}s")
         
         return {
             "status": "success",
             "analysis": receipt_json,
-            "message": "Receipt analyzed and added to conversation history"
+            "processing_time": f"{elapsed:.2f}s",
+            "method": "vision_ocr"
         }
         
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
+        import traceback
+        return JSONResponse(
+            status_code=500, 
+            content={"error": str(e), "traceback": traceback.format_exc()}
+        )
+# Pomocnicza funkcja async do zapisu (nie blokuje odpowiedzi)
+async def save_receipt_to_history(user_id: str, receipt_json: dict, message: str):
+    """
+    Zapisuje paragon do historii konwersacji w tle.
+    """
+    try:
+        # Zapisz do cache/bazy
+        save_message_to_db(user_id, "user", f"Receipt uploaded: {json.dumps(receipt_json)}")
+        save_message_to_db(user_id, "assistant", message)
+        
+        print(f"✅ Receipt saved for user {user_id}: {receipt_json.get('shop')}")
+    except Exception as e:
+        print(f"❌ Error saving receipt: {e}")
+        
 @router.post("/chat")
 async def chat(
     request: dict = Body(...),
@@ -249,7 +294,7 @@ def get_conversation_history(user_id: str, max_messages: int = 20) -> list:
             "content": data["content"]
         })
     
-    # Odwróć kolejność (od najstarszych do najnowszych)
+   
     return list(reversed(history))
 
 
