@@ -100,7 +100,7 @@ def analyze_image(
                     ]
                 }
             ],
-             
+            response_format={"type": "json_object"}  # Wymusza JSON
         )
         
         
