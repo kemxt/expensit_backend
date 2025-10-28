@@ -91,9 +91,9 @@ def analyze_image(
                     "content": [
                         {
                             "type": "text",
-                            "text": ("Analyze this receipt and return JSON",
-                                     "Do NOT include any explanations. Only return JSON with keys in double quotes."
-                                     )
+                            "text": "Analyze this receipt and return JSON, Do NOT include any explanations. Only return JSON with keys in double quotes.",
+                                     
+                                     
                         },
                         {
                             "type": "image_url",
