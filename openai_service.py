@@ -1,26 +1,18 @@
-import asyncio
-import base64
 import datetime
-from io import BytesIO
-import io
 import os
-import tempfile
-import time
-from PIL import Image
-from fastapi import Body, FastAPI, HTTPException, APIRouter, requests
+from fastapi import Body, FastAPI, HTTPException, APIRouter
 from fastapi.responses import JSONResponse, StreamingResponse
-import httpx
-from openai import AsyncOpenAI, OpenAI
-import requests
+from openai import OpenAI
 import json
 from dotenv import load_dotenv
-from typing import Dict, Any
 from pydantic import BaseModel, HttpUrl
 import firebase_admin
 from firebase_admin import credentials, storage, auth
 from fastapi import Body, FastAPI, HTTPException, Depends, Header
-from typing import Dict, Optional
+from typing import Optional
 from users import get_or_create_assistant, get_or_create_thread
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "config/expensit-10546-firebase-adminsdk-q25nr-1769d00b3c.json"
+
 
 router = APIRouter()
 
@@ -37,7 +29,7 @@ class ImageAnalysisRequest(BaseModel):
     
 
 
-cred = credentials.Certificate("config/expensit-10546-firebase-adminsdk-q25nr-f97f281a02.json")
+cred = credentials.Certificate("config/expensit-10546-firebase-adminsdk-q25nr-1769d00b3c.json")
 firebase_admin.initialize_app(cred, {
     'storageBucket': 'gs://expensit-10546.appspot.com/images'
 })
@@ -135,7 +127,7 @@ def analyze_image(
         
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-    
+
 @router.post("/chat")
 async def chat(
     request: dict = Body(...),
@@ -154,48 +146,63 @@ async def chat(
                 content={"error": "Message cannot be empty"}
             )
         
-        # Pobierz asystenta i thread
-        agent_id = get_or_create_assistant(user_id,products)
-        thread_id = get_or_create_thread(user_id, agent_id)
-        
         print(f"User: {user_id}")
-        print(f"Agent: {agent_id}")
-        print(f"Thread: {thread_id}")
         print(f"Message: {user_message}")
+        print(f"Products count: {len(products)}")
         
-        # Dodaj wiadomość użytkownika do thread'a
-        openai_client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=user_message
-        )
-       
+        # Pobierz historię konwersacji z bazy danych
+        conversation_history = get_conversation_history(user_id)
+        
+        # Przygotuj system prompt z kontekstem produktów
+        system_message = {
+            "role": "system",
+            "content": f"""Jesteś pomocnym asystentem finansowym. Pomagasz użytkownikowi zarządzać wydatkami i analizować zakupy.
+
+KONTEKST PRODUKTÓW UŻYTKOWNIKA:
+{json.dumps(products, indent=2, ensure_ascii=False)}
+
+Odpowiadaj na pytania użytkownika wykorzystując ten kontekst. 
+Gdy użytkownik pyta o swoje zakupy, wydatki lub produkty, odnosi się do danych powyżej.
+Bądź konkretny, pomocny i przyjaźnie nastawiony."""
+        }
+        
+        # Zbuduj pełną listę wiadomości
+        messages = [system_message] + conversation_history + [
+            {"role": "user", "content": user_message}
+        ]
+        
         # Generator do streamowania odpowiedzi
         async def generate():
-            message = ''
+            full_response = ''
             try:
-                with openai_client.beta.threads.runs.stream(
-                    thread_id=thread_id,
-                    assistant_id=agent_id,
-                ) as stream:
-                    for event in stream:
-                        # Streamuj fragmenty tekstu
-                        if event.event == "thread.message.delta":
-                            for content in event.data.delta.content:
-                                if hasattr(content, 'text') and hasattr(content.text, 'value'):
-                                    yield f"data: {json.dumps({'type': 'content', 'text': content.text.value})}\n\n"
-                                    
-                                    message += content.text.value
-                        # Wyślij status zakończenia
-                        elif event.event == "thread.run.completed":
-                            yield f"data: {json.dumps({'type': 'done', 'thread_id': thread_id})}\n\n"
-                            print(message)
-                        # Obsłuż błędy
-                        elif event.event == "thread.run.failed":
-                            yield f"data: {json.dumps({'type': 'error', 'message': 'Run failed'})}\n\n"
-                            
+                stream = openai_client.chat.completions.create(
+                    model="gpt-4o",  # lub "gpt-4o", "gpt-3.5-turbo"
+                    messages=messages,
+                    stream=True,
+                    temperature=0.7,
+                    max_tokens=1500
+                )
+                
+                for chunk in stream:
+                    
+                    if chunk.choices[0].delta.content is not None:
+                        content = chunk.choices[0].delta.content
+                        full_response += content
+                        
+                        # Wyślij fragment do frontendu
+                        yield f"data: {json.dumps({'type': 'content', 'text': content}, ensure_ascii=False)}\n\n"
+                
+                # Zapisz wiadomości do bazy danych
+                save_message_to_db(user_id, "user", user_message)
+                save_message_to_db(user_id, "assistant", full_response)
+                
+               
+                print(f"Full response: {full_response}")
+                yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+                
             except Exception as e:
-                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                print(f"Error in generate: {str(e)}")
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
         
         return StreamingResponse(
             generate(),
@@ -209,6 +216,8 @@ async def chat(
             
     except Exception as e:
         import traceback
+        print(f"Error: {str(e)}")
+        print(traceback.format_exc())
         return JSONResponse(
             status_code=500,
             content={
@@ -216,6 +225,48 @@ async def chat(
                 "traceback": traceback.format_exc()
             }
         )
+
+
+# Funkcje pomocnicze do zarządzania historią konwersacji
+
+def get_conversation_history(user_id: str, max_messages: int = 20) -> list:
+    """
+    Pobiera historię konwersacji z bazy danych.
+    Ogranicz do ostatnich max_messages wiadomości, żeby nie przekroczyć limitu tokenów.
+    """
+    # Przykład z Firestore:
+    from google.cloud import firestore
+    db = firestore.Client()
+    
+    messages_ref = db.collection('users').document(user_id).collection('messages')
+    messages = messages_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(max_messages).stream()
+    
+    history = []
+    for msg in messages:
+        data = msg.to_dict()
+        history.append({
+            "role": data["role"],
+            "content": data["content"]
+        })
+    
+    # Odwróć kolejność (od najstarszych do najnowszych)
+    return list(reversed(history))
+
+
+def save_message_to_db(user_id: str, role: str, content: str):
+    """
+    Zapisuje wiadomość do bazy danych.
+    """
+    from google.cloud import firestore
+    from datetime import datetime
+    
+    db = firestore.Client()
+    
+    db.collection('users').document(user_id).collection('messages').add({
+        'role': role,
+        'content': content,
+        'timestamp': datetime.utcnow()
+    })
 
 @router.delete("/chat/clear")
 def clear_chat_history(user_token: dict = Depends(verify_firebase_token)):

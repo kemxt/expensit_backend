@@ -1,2 +1,11 @@
 /.env
 .env
+
+*.key
+*.pem
+firebase-key.json
+service-account.json
+__pycache__/
+*.pyc
+venv/
+.vscode/
