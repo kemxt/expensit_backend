@@ -75,7 +75,6 @@ async def analyze_image(
         openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         user_id = user_token["uid"]
         image_path = image_data["image_path"].strip().lstrip('/')
-
         if not image_path.startswith(f"users/{user_id}/"):
             return JSONResponse(status_code=403, content={"error": "Access denied"})
 
@@ -88,13 +87,11 @@ async def analyze_image(
        
         print(f"⏱️ Running Vision OCR...")
         ocr_start = time.time()
-        
         vision_client = vision.ImageAnnotatorClient()
         image_bytes = await asyncio.to_thread(blob.download_as_bytes)
         image = vision.Image(content=image_bytes)
-        
         response = await asyncio.to_thread(
-            vision_client.document_text_detection,  # Lepsze dla paragonów niż text_detection
+            vision_client.document_text_detection, 
             image=image
         )
         
