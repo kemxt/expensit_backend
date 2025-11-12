@@ -13,6 +13,7 @@ import os
 from rapidfuzz import fuzz
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+import torch
 from openai_service import router as openai_router
 import numpy as np
 
@@ -412,89 +413,152 @@ def check_product(product: ProductIn):
         "price_changed": None,
         "similarity": similarity
     }
+_model_cache = None
+
+def get_model():
+    global _model_cache
+    if _model_cache is None:
+        _model_cache = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        # Przenieś na GPU jeśli dostępne
+        if torch.cuda.is_available():
+            _model_cache = _model_cache.to('cuda')
+    return _model_cache
+
 @app.post("/products/compare/bulk")
 def check_products_bulk(products_in: List[ProductIn]):
-    results = []
-
-    # 1. Przygotuj model tylko raz
-    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-    # 2. Przygotuj embeddings dla wejściowych produktów
+    if not products_in:
+        return []
+    
+    model = get_model()
+    
+    # 1. Przygotuj embeddings wsadowo (wszystkie naraz)
     texts_to_embed = []
-    for p in products_in:
-        if p.embedding:
-            texts_to_embed.append(None)
-        else:
+    indices_to_embed = []
+    
+    for idx, p in enumerate(products_in):
+        if not p.embedding:
             texts_to_embed.append(p.description or p.name)
-
-    bulk_embeddings = []
-    if any(t is not None for t in texts_to_embed):
-        embeddings_computed = model.encode(
-            [t for t in texts_to_embed if t is not None]
+            indices_to_embed.append(idx)
+    
+    # Oblicz embeddings wsadowo
+    product_embeddings = [None] * len(products_in)
+    if texts_to_embed:
+        computed_embeddings = model.encode(
+            texts_to_embed, 
+            batch_size=32,
+            show_progress_bar=False,
+            convert_to_numpy=True
         )
-        embed_index = 0
-        for t in texts_to_embed:
-            if t is None:
-                bulk_embeddings.append(None)
-            else:
-                bulk_embeddings.append(embeddings_computed[embed_index])
-                embed_index += 1
-
-    # 3. Pobierz wszystkich kandydatów z bazy (id, name, embedding)
+        for idx, embed_idx in enumerate(indices_to_embed):
+            product_embeddings[embed_idx] = computed_embeddings[idx]
+    
+    # Uzupełnij już istniejące embeddings
+    for idx, p in enumerate(products_in):
+        if p.embedding and product_embeddings[idx] is None:
+            product_embeddings[idx] = np.array(p.embedding, dtype=np.float32)
+    
+    # 2. Pobierz wszystkich kandydatów JEDEN RAZ z pre-parsowanymi embeddingami
     with engine.connect() as conn:
-        candidates = conn.execute(
+        candidates_raw = conn.execute(
             select(products.c.id, products.c.name, products.c.embedding)
         ).all()
-
-    # 4. Dla każdego produktu wejściowego znajdź najlepsze dopasowanie
+    
+    # Parsuj embeddings kandydatów RAZ
+    candidates = []
+    for pid, pname, pemb in candidates_raw:
+        candidates.append((
+            pid,
+            pname,
+            np.array(json.loads(pemb), dtype=np.float32)
+        ))
+    
+    # 3. Pre-compute wszystkie similarity scores w macierzach (ZNACZNIE SZYBSZE)
+    candidate_embeddings = np.array([c[2] for c in candidates], dtype=np.float32)
+    candidate_names = [c[1] for c in candidates]
+    candidate_ids = [c[0] for c in candidates]
+    
+    results = []
+    best_matches = []  # (product_idx, best_id, best_score)
+    
+    # 4. Oblicz similarity dla wszystkich produktów
     for idx, p in enumerate(products_in):
-        query_embedding = np.array(p.embedding) if p.embedding else bulk_embeddings[idx]
-
-        best_id = None
+        query_embedding = product_embeddings[idx]
+        
+        # Wektoryzowane obliczenie cosine similarity dla wszystkich kandydatów naraz
+        cosine_scores = np.dot(candidate_embeddings, query_embedding) / (
+            np.linalg.norm(candidate_embeddings, axis=1) * np.linalg.norm(query_embedding)
+        )
+        
+        # Oblicz string similarity tylko dla top-K kandydatów (np. top 10)
+        top_k = min(10, len(candidates))
+        top_indices = np.argpartition(cosine_scores, -top_k)[-top_k:]
+        
         best_score = 0.0
-
-        for pid, pname, pemb in candidates:
-            pemb_array = np.array(json.loads(pemb), dtype=float)
-            score = hybrid_similarity(p.name, pname, query_embedding, pemb_array, alpha=0.7)
+        best_idx = None
+        
+        for cand_idx in top_indices:
+            text_sim = text_similarity(p.name, candidate_names[cand_idx])
+            # hybrid_similarity z alpha=0.7
+            score = 0.7 * cosine_scores[cand_idx] + 0.3 * text_sim
+            
             if score > best_score:
                 best_score = score
-                best_id = pid
-
-        # 5. Jeśli najlepsze dopasowanie przekracza próg
-        if best_id and best_score >= 0.75:
-            with engine.connect() as conn:
-                result = conn.execute(
-                    select(products.c.name, prices.c.price)
-                    .select_from(products.join(prices, products.c.id == prices.c.id))
-                    .where(prices.c.id == best_id)
-                ).first()
-
-                if result:
-                    old_price = float(result.price)
-                    price_changed = old_price != p.price
-                    results.append({
-                        "exists": True,
-                        "id": best_id,
-                        "name": result.name,
-                        "old_price": old_price,
-                        "new_price": p.price,
-                        "price_changed": price_changed,
-                        "similarity": best_score
-                    })
-                    continue
-
-        # 6. Brak dopasowania
-        results.append({
-            "exists": False,
-            "id": None,
-            "name": None,
-            "old_price": None,
-            "new_price": p.price,
-            "price_changed": None,
-            "similarity": best_score
-        })
-
+                best_idx = cand_idx
+        
+        if best_idx is not None and best_score >= 0.75:
+            best_matches.append((idx, candidate_ids[best_idx], best_score))
+        else:
+            best_matches.append((idx, None, best_score))
+    
+    # 5. Pobierz ceny JEDNYM ZAPYTANIEM (batch)
+    matched_ids = [bid for _, bid, _ in best_matches if bid is not None]
+    
+    price_map = {}
+    if matched_ids:
+        with engine.connect() as conn:
+            price_results = conn.execute(
+                select(products.c.id, products.c.name, prices.c.price)
+                .select_from(products.join(prices, products.c.id == prices.c.id))
+                .where(products.c.id.in_(matched_ids))
+            ).all()
+            
+            for pid, pname, pprice in price_results:
+                price_map[pid] = (pname, float(pprice))
+    
+    # 6. Złóż wyniki
+    for idx, (prod_idx, best_id, best_score) in enumerate(best_matches):
+        p = products_in[prod_idx]
+        
+        if best_id and best_id in price_map:
+            pname, old_price = price_map[best_id]
+            results.append({
+                "exists": True,
+                "id": best_id,
+                "name": pname,
+                "old_price": old_price,
+                "new_price": p.price,
+                "price_changed": old_price != p.price,
+                "similarity": float(best_score)
+            })
+        else:
+            results.append({
+                "exists": False,
+                "id": None,
+                "name": None,
+                "old_price": None,
+                "new_price": p.price,
+                "price_changed": None,
+                "similarity": float(best_score)
+            })
+    
     return results
+
+
+# Pomocnicza funkcja do text similarity (jeśli używasz)
+def text_similarity(text1: str, text2: str) -> float:
+    """Szybka text similarity (np. Levenshtein ratio)"""
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
 @app.get("/products", response_model=list[SimpleProductResponse])
 def get_products():
     with engine.connect() as conn:

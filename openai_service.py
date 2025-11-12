@@ -70,7 +70,6 @@ async def analyze_image(
     user_token: dict = Depends(verify_firebase_token)
 ):
     start_time = time.time()
-    
     try:
         openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         user_id = user_token["uid"]
@@ -95,11 +94,12 @@ async def analyze_image(
             image=image
         )
         
+        
         if not response.full_text_annotation:
             return JSONResponse(status_code=400, content={"error": "No text found"})
         
         raw_text = response.full_text_annotation.text
-        
+        print(raw_text)
         print(f"✅ OCR done in {time.time() - ocr_start:.2f}s ({len(raw_text)} chars)")
         
         # KROK 2: GPT-4o strukturyzuje tekst (~3-5s, szybsze niż analiza obrazu)
@@ -129,7 +129,7 @@ Return structured JSON."""
             ],
             response_format={"type": "json_object"},
             temperature=0,
-            max_tokens=1500
+            max_completion_tokens=1500
         )
         
         print(f"✅ Structured in {time.time() - gpt_start:.2f}s")
@@ -166,7 +166,7 @@ async def save_receipt_to_history(user_id: str, receipt_json: dict, message: str
         save_message_to_db(user_id, "user", f"Receipt uploaded: {json.dumps(receipt_json)}")
         save_message_to_db(user_id, "assistant", message)
         
-        print(f"✅ Receipt saved for user {user_id}: {receipt_json.get('shop')}")
+        print(f"✅ Receipt saved for user {user_id}: {receipt_json.get('Store_Name')}")
     except Exception as e:
         print(f"❌ Error saving receipt: {e}")
         
