@@ -93,8 +93,7 @@ async def analyze_image(
             vision_client.document_text_detection, 
             image=image
         )
-        
-        
+
         if not response.full_text_annotation:
             return JSONResponse(status_code=400, content={"error": "No text found"})
         
